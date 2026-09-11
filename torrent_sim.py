@@ -28,7 +28,7 @@ class Transfer:
 class TorrentSim:
     """Operates as the global discrete event engine and network manager"""
     def __init__(self):
-        self.swarms = {}
+        self.swarms = {} # torrent_id -> swarm
         self.time = 0.0
         self.counter = 0  # Unique tie-breaker sequence number
         self.transfer_counter = 0
@@ -36,6 +36,7 @@ class TorrentSim:
         self.active_transfers = set()
         self.agents = []
 
+    # world-level setup
     def add_swarm(self, swarm):
         self.swarms[swarm.torrent_id] = swarm
 
@@ -46,6 +47,7 @@ class TorrentSim:
             (self.time + delay, self.counter, event_type, agent, data)
         )
 
+    # handling network model
     def _update_transfer_progress(self):
         """Advance bytes transferred for active streams up to this sim time"""
         for t in self.active_transfers:
@@ -55,6 +57,7 @@ class TorrentSim:
                 t.remaining_mb = max(0.0, t.remaining_mb - mb_transferred)
             t.last_update_time = self.time
 
+    # per-channel chunk capacity following Fan et al/
     def recalculate_bandwidth(self):
         """
         Dynamically divide uploader/downloader capcaity among active streams per Fan et al. per-chunk capacity formulation
@@ -95,22 +98,24 @@ class TorrentSim:
 
     def finish_transfer(self, transfer):
         t_id = transfer.torrent_id
+        downloader = transfer.downloader
+
         self.active_transfers.remove(transfer)
-        transfer.downloader.active_downloads.remove(transfer)
+        downloader.active_downloads.remove(transfer)
         transfer.uploader.active_uploads.remove(transfer)
 
-        transfer.downloader.downloading_pieces[t_id].remove(transfer.piece_id)
-        transfer.downloader.completed_pieces[t_id].add(transfer.piece_id)
+        downloader.downloading_pieces[t_id].remove(transfer.piece_id)
+        downloader.completed_pieces[t_id].add(transfer.piece_id)
 
         # record metrics
-        transfer.downloader.record_useful_chunks(self,t_id)
-
-        # # wake up idle neighbours now that a new piece is available
-        # for neighbour in transfer.downloader.neighbours:
-        #     if not neighbour.active_downloads:
-        #         self.schedule(0.0, "PICK_PIECE", neighbour)
-
+        downloader.record_useful_chunks(self,t_id)
         self.recalculate_bandwidth()
+
+        self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
+        # wake up any idle neighbours in this swarm (Fixes cascading pipeline stall)
+        for neighbours in downloader.neighbours[t_id]:
+            if not any(t.torrent_id == t_id for t in neighbours.active_downloads):
+                self.schedule(0.0, "PICK_PIECE", neighbours, data=t_id)
 
     def append_pieces(self, torrent_id, count, publisher_agent):
         """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
@@ -136,7 +141,8 @@ class TorrentSim:
 
         # Trigger idle leechers to evaluate total completion
         for agent in swarm.participants:
-            self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
+            if not any(t.torrent_id == torrent_id for t in agent.active_downloads):
+                self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
         
     def run(self):
         while self.event_queue:
@@ -148,7 +154,7 @@ class TorrentSim:
 
             elif event_type == "APPEND_PIECES":
                 torrent_id, count = data
-                agent.append_pieces(self, count, torrent_id)
+                self.append_pieces(torrent_id, count, agent)
 
             elif event_type == "FINALIZE_STREAM":
                 torrent_id = data
@@ -280,6 +286,10 @@ class Agent:
         if torrent_id not in self.completed_pieces:
             return
 
+        # Guard: If agent is already actively downloading in this swarm, wait for that download to finish
+        if any(t.torrent_id == torrent_id for t in self.active_downloads):
+            return
+        
         if self.start_time[torrent_id] is None:
             self.start_time[torrent_id] = sim.time
 
@@ -337,6 +347,11 @@ class Agent:
         elif strategy == "cascading":
             # check if current bound target peer still has missing pieces to offer
             upstream = self.upstream_peers.get(torrent_id)
+            # default to first connected neighbour if None
+            if upstream is None and len(neighbours) > 0:
+                upstream = neighbours[0]
+                self.upstream_peers[torrent_id] = upstream
+
             if upstream is not None:
                 available = upstream.completed_pieces[torrent_id] & missing
                 if available:
@@ -398,157 +413,61 @@ class Agent:
                 piece_id=chosen_piece
             )
 
-def run_benchmark(strategy_name):
-    sim = TorrentSim(published_pieces=20, piece_size_mb=1)  # 20 MB total file
-
-    # Seed
-    seeder = Peer(peer_id=0, upload_speed_mbps=10)
-    seeder.completed_pieces = set(range(200))
-
-    # 4 Leechers
-    leechers = []
-    prev_peer = seeder
-    for i in range(1, 100):
-        p = Peer(peer_id=i, strategy=strategy_name, download_speed_mbps=10, upload_speed_mbps=10)
-        
-        if strategy_name == "cascading":
-            p.upstream_peer = prev_peer
-            p.connect(prev_peer)
-            prev_peer = p
-        else:
-            seeder.connect(p)
-            for existing in leechers:
-                existing.connect(p)
-                
-        leechers.append(p)
-
-    sim.peers = leechers
-
-    for p in leechers:
-        sim.schedule(0.0, "PICK_PIECE", p)
-
-    sim.run()
-
-    # Collect average metrics across leechers
-    t_avg = sum(p.get_metrics(sim)[0] for p in leechers) / len(leechers)
-    s_avg = sum(p.get_metrics(sim)[1] for p in leechers) / len(leechers)
-    r_avg = sum(p.get_metrics(sim)[2] for p in leechers) / len(leechers)
-
-    return t_avg, s_avg, r_avg
-
-
-def run_mutable_benchmark(strategy_name, hybrid_s=0.5, segment_k=4):
-    # Initialize with 8 pieces
-    sim = TorrentSim(initial_pieces=8, piece_size_mb=1)
-
-    # Publisher / Seeder starts with initial 8 pieces
-    publisher = Peer(peer_id=0, upload_speed_mbps=10)
-    publisher.completed_pieces = set(range(8))
-
-    leechers = []
-    prev_peer = publisher
-    for i in range(1, 10):
-        p = Peer(
-            peer_id=i, 
-            strategy=strategy_name, 
-            hybrid_s=hybrid_s, 
-            segment_k=segment_k,
-            download_speed_mbps=10, 
-            upload_speed_mbps=10
-        )
-        
-        if strategy_name == "cascading":
-            p.upstream_peer = prev_peer
-            p.connect(prev_peer)
-            prev_peer = p
-        else:
-            publisher.connect(p)
-            for existing in leechers:
-                existing.connect(p)
-                
-        leechers.append(p)
-
-    sim.peers = [publisher] + leechers
-
-    # Schedule dynamic stream events
-    sim.schedule(0.0, "PICK_PIECE", leechers[0])
-    sim.schedule(0.0, "PICK_PIECE", leechers[1])
-    sim.schedule(0.0, "PICK_PIECE", leechers[2])
-
-    # Dynamic appends: +4 pieces at t=5s, +4 pieces at t=10s, finalize at t=12s
-    sim.schedule(5.0, "APPEND_PIECES", publisher, data=(4, publisher))
-    sim.schedule(10.0, "APPEND_PIECES", publisher, data=(4, publisher))
-    sim.schedule(12.0, "FINALIZE_STREAM", publisher)
-
-    sim.run()
-
-    t_avg = sum(p.get_metrics(sim)[0] for p in leechers) / len(leechers)
-    s_avg = sum(p.get_metrics(sim)[1] for p in leechers) / len(leechers)
-    r_avg = sum(p.get_metrics(sim)[2] for p in leechers) / len(leechers)
-
-    return t_avg, s_avg, r_avg
-
 if __name__=="__main__":
-# Compare strategies in mutable stream scenario
     sim = TorrentSim()
 
-    # Swarm A: Video on Demand Stream (10 pieces)
-    swarm_vod = Swarm("Movie_Stream", initial_pieces=10, piece_size_mb=1)
-
-    # Swarm B: Operating System ISO (10 pieces)
-    swarm_iso = Swarm("OS_ISO", initial_pieces=10, piece_size_mb=1)
+    swarm_vod = Swarm("Movie_Stream", initial_pieces=6, piece_size_mb=1)
+    swarm_iso = Swarm("OS_ISO", initial_pieces=4, piece_size_mb=1)
 
     sim.add_swarm(swarm_vod)
     sim.add_swarm(swarm_iso)
 
-    # 6 Physical Agents (10 Mbps network interfaces)
     agents = [Agent(agent_id=i, download_speed_mbps=10, upload_speed_mbps=10) for i in range(6)]
     sim.agents = agents
 
-    # --- SWARM A ("Movie_Stream") SETUP ---
-    # Agent 0 is Seeder
+    # --- SWARM A: Cascading Pipeline (Agent 0 -> Agent 1 -> Agent 2 -> Agent 3) ---
     agents[0].join_swarm(swarm_vod, is_seeder=True)
-    # Agents 1, 2, 3 are Leechers
-    agents[1].join_swarm(swarm_vod, strategy="sequential")
-    agents[2].join_swarm(swarm_vod, strategy="segment_random", segment_k=3)
-    agents[3].join_swarm(swarm_vod, strategy="rarest_random")
+    agents[1].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[0])
+    agents[2].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[1])
+    agents[3].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[2])
 
-    # Connect overlay graph for Movie_Stream
-    for leecher_id in [1, 2, 3]:
-        agents[0].connect(agents[leecher_id], "Movie_Stream")
-        for other_id in [1, 2, 3]:
-            if leecher_id != other_id:
-                agents[leecher_id].connect(agents[other_id], "Movie_Stream")
+    agents[0].connect(agents[1], "Movie_Stream")
+    agents[1].connect(agents[2], "Movie_Stream")
+    agents[2].connect(agents[3], "Movie_Stream")
 
-    # --- SWARM B ("OS_ISO") SETUP ---
-    # Agent 4 is Seeder
+    # --- SWARM B: Mesh Swarm ---
     agents[4].join_swarm(swarm_iso, is_seeder=True)
-    # Agents 1, 2, 5 are Leechers (Agents 1 & 2 overlap with Movie_Stream!)
-    agents[1].join_swarm(swarm_iso, strategy="rarest_random")
-    agents[2].join_swarm(swarm_iso, strategy="hybrid", hybrid_s=0.5)
-    agents[5].join_swarm(swarm_iso, strategy="rarest_random")
+    agents[1].join_swarm(swarm_iso, strategy="cascading")            # Agent 1 in BOTH swarms
+    agents[2].join_swarm(swarm_iso, strategy="cascading", hybrid_s=0.5)     # Agent 2 in BOTH swarms
+    agents[5].join_swarm(swarm_iso, strategy="cascading")
 
-    # Connect overlay graph for OS_ISO
     for leecher_id in [1, 2, 5]:
         agents[4].connect(agents[leecher_id], "OS_ISO")
         for other_id in [1, 2, 5]:
             if leecher_id != other_id:
                 agents[leecher_id].connect(agents[other_id], "OS_ISO")
 
-    # Schedule Swarm initializations
+    # Schedule initial pick events
     for a in [agents[1], agents[2], agents[3]]:
         sim.schedule(0.0, "PICK_PIECE", a, data="Movie_Stream")
 
     for a in [agents[1], agents[2], agents[5]]:
         sim.schedule(0.0, "PICK_PIECE", a, data="OS_ISO")
 
-    # Finalize streams
-    sim.schedule(0.0, "FINALIZE_STREAM", agents[0], data="Movie_Stream")
-    sim.schedule(0.0, "FINALIZE_STREAM", agents[4], data="OS_ISO")
+    # Schedule Dynamic Appends and Stream Closures
+    sim.schedule(4.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
+    sim.schedule(8.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
+    sim.schedule(10.0, "FINALIZE_STREAM", agents[0], data="Movie_Stream")
+
+    sim.schedule(6.0, "APPEND_PIECES", agents[4], data=("OS_ISO", 6))
+    sim.schedule(12.0, "FINALIZE_STREAM", agents[4], data="OS_ISO")
+
+    print("=" * 80)
+    print("MUTABLE CONCURRENT TORRENT TRACE (CASCADING FIXED)")
+    print("=" * 80)
 
     sim.run()
 
-    # Display Per-Swarm Metrics
     print("\n" + "=" * 80)
     print(f"{'Agent ID':<10} | {'Swarm ID':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
     print("-" * 80)
@@ -558,4 +477,3 @@ if __name__=="__main__":
             if agent.start_time.get(t_id) is not None and agent.finish_time.get(t_id) is not None:
                 t, s, r = agent.get_metrics(sim, t_id)
                 print(f"Agent {agent.agent_id:<4} | {t_id:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
-        
