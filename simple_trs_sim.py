@@ -16,10 +16,9 @@ class Transfer:
         self.scheduled_finish_time = float('inf')
         
 class TorrentSim:
-    def __init__(self, initial_pieces=10, piece_size_mb=1):
-        self.published_pieces = initial_pieces
+    def __init__(self, num_pieces=20, piece_size_mb=1):
+        self.num_pieces = num_pieces
         self.piece_size_mb = piece_size_mb
-        self.is_finalized = False # flag for closing the stream
         self.time = 0.0
         self.counter = 0  # Unique tie-breaker sequence number
         self.transfer_counter = 0
@@ -92,46 +91,14 @@ class TorrentSim:
 
         self.recalculate_bandwidth()
 
-    def append_pieces(self, count, publisher_peer):
-        """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
-        new_start = self.published_pieces
-        self.published_pieces += count
-        new_pieces = set(range(new_start, self.published_pieces))
-
-        publisher_peer.completed_pieces.update(new_pieces)
-        print(f"[Time {self.time:6.2f}s] APPEND: +{count} pieces added. "
-              f"New stream horizon: [0 .. {self.published_pieces - 1}]")
-
-        # wake up idle leechers
-        for peer in self.peers:
-            if peer != publisher_peer and not peer.active_downloads:
-                self.schedule(0.0, "PICK_PIECE", peer)
-
-    def finalize_stream(self):
-        """Mark the stream as complete"""
-        self.is_finalized = True
-        print(f"[Time {self.time:6.2f}s] FINALIZE: Stream closed at {self.published_pieces} total pieces.")
-
-        # Trigger idle leechers to evaluate total completion
-        for peer in self.peers:
-            if not peer.active_downloads:
-                self.schedule(0.0, "PICK_PIECE", peer)
-        
     def run(self):
         while self.event_queue:
             self.time, _, event_type, peer, data = heapq.heappop(self.event_queue)
             if event_type == "PICK_PIECE":
                 peer.pick_next_piece(self)
-
-            elif event_type == "APPEND_PIECES":
-                count, publisher = data
-                self.append_pieces(count, publisher)
-
-            elif event_type == "FINALIZE_STREAM":
-                self.finalize_stream()
-
             elif event_type == "PIECE_COMPLETE":
                 transfer = data
+
                 # filter stale events
                 if abs(self.time - transfer.scheduled_finish_time) > 1e-7:
                     continue
@@ -140,9 +107,9 @@ class TorrentSim:
                     self.finish_transfer(transfer)
                     print(f"[Time {self.time:6.2f}s] Peer {peer.peer_id:2d} got piece {transfer.piece_id:2d} "
                           f"from Peer {transfer.uploader.peer_id:2d} "
-                          f"({len(peer.completed_pieces)}/{self.published_pieces} complete)")
+                          f"({len(peer.completed_pieces)}/{self.num_pieces} complete)")
 
-                    if len(peer.completed_pieces) == self.published_pieces:
+                    if len(peer.completed_pieces) == self.num_pieces:
                         peer.finish_time = self.time
                     else:
                         # Immediately attempt to request next piece
@@ -157,7 +124,6 @@ class Peer:
         self.strategy = strategy # "rarest_random", "sequential", "cascading", "hybrid", "segment_random"
         self.hybrid_s = hybrid_s
         self.segment_k = segment_k
-
         self.completed_pieces = set()
         self.downloading_pieces = set()
         self.neighbours = []
@@ -195,13 +161,13 @@ class Peer:
     def compute_current_r_bar(self, sim):
         """r_bar per Eq. 8 in Fan et al."""
         r_i_sum = 0
-        for p in range(sim.published_pieces):
+        for p in range(sim.num_pieces):
             if self.strategy == "cascading":
                 if self.upstream_peer and p in self.upstream_peer.completed_pieces:
                     r_i_sum += 1
             else:
                 r_i_sum += sum(1 for n in self.neighbours if p in n.completed_pieces)
-        return r_i_sum / sim.published_pieces
+        return r_i_sum / sim.num_pieces
 
     def get_metrics(self, sim, p_error=0.5):
         """Return Throughput [Mbps], Sequentiality [0..1], Robustness [0..1]"""
@@ -210,11 +176,11 @@ class Peer:
 
         # throughput
         duration = self.finish_time - self.start_time
-        file_size_bits = sim.published_pieces * sim.piece_size_mb * 8.0
+        file_size_bits = sim.num_pieces * sim.piece_size_mb * 8.0
         throughput = file_size_bits / duration if duration > 0 else 0.0
 
         # sequentiality (eq. 10)
-        sequentiality = sum(self.u_x_history) / sim.published_pieces if self.u_x_history else 0.0
+        sequentiality = sum(self.u_x_history) / sim.num_pieces if self.u_x_history else 0.0
 
         # robustness (eq. 8)
         avg_r_bar = sum(self.r_bar_snapshots) / len(self.r_bar_snapshots) if self.r_bar_snapshots else 0.0
@@ -230,13 +196,8 @@ class Peer:
         if self.active_downloads:
             return
 
-        missing = set(range(sim.published_pieces)) - self.completed_pieces - self.downloading_pieces
+        missing = set(range(sim.num_pieces)) - self.completed_pieces - self.downloading_pieces
         if not missing:
-            # Handle stream completion if finalized while idle
-            if len(self.completed_pieces) == sim.published_pieces and sim.is_finalized and self.finish_time is None:
-                self.finish_time = sim.time
-                print(f"[Time {sim.time:6.2f}s] Peer {self.peer_id:2d} ({self.strategy:14s}) "
-                      f"COMPLETED full stream ({sim.published_pieces}/{sim.published_pieces})")
             return
 
         chosen_piece = None
@@ -336,7 +297,7 @@ class Peer:
             )
 
 def run_benchmark(strategy_name):
-    sim = TorrentSim(published_pieces=20, piece_size_mb=1)  # 20 MB total file
+    sim = TorrentSim(num_pieces=20, piece_size_mb=1)  # 20 MB total file
 
     # Seed
     seeder = Peer(peer_id=0, upload_speed_mbps=10)
@@ -373,97 +334,15 @@ def run_benchmark(strategy_name):
 
     return t_avg, s_avg, r_avg
 
-
-def run_mutable_benchmark(strategy_name, hybrid_s=0.5, segment_k=4):
-    # Initialize with 8 pieces
-    sim = TorrentSim(initial_pieces=8, piece_size_mb=1)
-
-    # Publisher / Seeder starts with initial 8 pieces
-    publisher = Peer(peer_id=0, upload_speed_mbps=10)
-    publisher.completed_pieces = set(range(8))
-
-    leechers = []
-    prev_peer = publisher
-    for i in range(1, 10):
-        p = Peer(
-            peer_id=i, 
-            strategy=strategy_name, 
-            hybrid_s=hybrid_s, 
-            segment_k=segment_k,
-            download_speed_mbps=10, 
-            upload_speed_mbps=10
-        )
-        
-        if strategy_name == "cascading":
-            p.upstream_peer = prev_peer
-            p.connect(prev_peer)
-            prev_peer = p
-        else:
-            publisher.connect(p)
-            for existing in leechers:
-                existing.connect(p)
-                
-        leechers.append(p)
-
-    sim.peers = [publisher] + leechers
-
-    # Schedule dynamic stream events
-    sim.schedule(0.0, "PICK_PIECE", leechers[0])
-    sim.schedule(0.0, "PICK_PIECE", leechers[1])
-    sim.schedule(0.0, "PICK_PIECE", leechers[2])
-
-    # Dynamic appends: +4 pieces at t=5s, +4 pieces at t=10s, finalize at t=12s
-    sim.schedule(5.0, "APPEND_PIECES", publisher, data=(4, publisher))
-    sim.schedule(10.0, "APPEND_PIECES", publisher, data=(4, publisher))
-    sim.schedule(12.0, "FINALIZE_STREAM", publisher)
-
-    sim.run()
-
-    t_avg = sum(p.get_metrics(sim)[0] for p in leechers) / len(leechers)
-    s_avg = sum(p.get_metrics(sim)[1] for p in leechers) / len(leechers)
-    r_avg = sum(p.get_metrics(sim)[2] for p in leechers) / len(leechers)
-
-    return t_avg, s_avg, r_avg
-
 if __name__=="__main__":
-    # Execute standard comparisons
-    # results = {}
-    # strats = ["rarest_random", "sequential", "cascading", "hybrid", "segment_random"]
-    # for strat in strats:
-    #     print(f"STRAT: {strat}")
-    #     results[strat] = run_benchmark(strat)
-
-    # print(f"{'Strategy':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
-    # print("-" * 72)
-    # for strat, (t, s, r) in results.items():
-    #     print(f"{strat:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
-
-    # execute mutable comparisons
-
-# Compare strategies in mutable stream scenario
-    print("=" * 80)
-    print("MUTABLE TORRENT SIMULATION TRACE & BENCHMARK")
-    print("=" * 80)
-
-    strategies = [
-        ("rarest_random", {}),
-        ("sequential", {}),
-        ("cascading", {}),
-        ("hybrid (s=0.5)", {"hybrid_s": 0.5}),
-        ("segment_random (K=4)", {"segment_k": 4}),
-    ]
-
+    # Execute comparisons
     results = {}
-    for label, kwargs in strategies:
-        strat_type = label.split()[0]
-        t, s, r = run_mutable_benchmark(strat_type, **kwargs)
-        results[label] = (t, s, r)
+    strats = ["rarest_random", "sequential", "cascading", "hybrid", "segment_random"]
+    for strat in strats:
+        print(f"STRAT: {strat}")
+        results[strat] = run_benchmark(strat)
 
-    print("\n" + "=" * 80)
-    print(f"{'Strategy Config':<23} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
-    print("-" * 80)
-
-    for label, (t, s, r) in results.items():
-        print(f"{label:<23} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
-
-        
+    print(f"{'Strategy':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
+    print("-" * 72)
+    for strat, (t, s, r) in results.items():
+        print(f"{strat:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
