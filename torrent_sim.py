@@ -116,11 +116,14 @@ class TorrentSim:
                         self.schedule(0.0, "PICK_PIECE", peer)
 
 class Peer:
-    def __init__(self, peer_id, download_speed_mbps=10, upload_speed_mbps=10, strategy="rarest_random", upstream_peer=None):
+    def __init__(self, peer_id, download_speed_mbps=10, upload_speed_mbps=10, 
+                 strategy="rarest_random", hybrid_s=0.5, segment_k=20, upstream_peer=None):
         self.peer_id = peer_id
         self.download_speed = download_speed_mbps
         self.upload_speed = upload_speed_mbps
-        self.strategy = strategy # "rarest_random", "sequential", or "cascading"
+        self.strategy = strategy # "rarest_random", "sequential", "cascading", "hybrid", "segment_random"
+        self.hybrid_s = hybrid_s
+        self.segment_k = segment_k
         self.completed_pieces = set()
         self.downloading_pieces = set()
         self.neighbours = []
@@ -239,6 +242,52 @@ class Peer:
                     chosen_piece = min(available)
                     target_peer = self.upstream_peer
 
+        # HYBRID (sequential w/ prob s, random w/ prob 1-s)
+        elif self.strategy == 'hybrid':
+            available_pieces = Counter()
+            peer_map = {}
+            for n in self.neighbours:
+                for p in n.completed_pieces:
+                    if p in missing:
+                        available_pieces[p] += 1
+                        peer_map.setdefault(p, []).append(n)
+
+            if available_pieces:
+                if random.random() < self.hybrid_s:
+                    chosen_piece = min(available_pieces.keys())
+                else:
+                    min_freq = min(available_pieces.values())
+                    rarest = [p for p, count in available_pieces.items() if count == min_freq]
+                    chosen_piece = random.choice(rarest)
+
+                target_peer = random.choice(peer_map[chosen_piece])
+
+        # SEGMENT-RANDOM (bucket sequential, intra-bucket random)
+        elif self.strategy == 'segment_random':
+            available_pieces = Counter()
+            peer_map = {}
+            for n in self.neighbours:
+                for p in n.completed_pieces:
+                    if p in missing:
+                        available_pieces[p] += 1
+                        peer_map.setdefault(p, []).append(n)
+
+            if available_pieces:
+                buckets = {}
+                for p in available_pieces:
+                    b_idx = p // self.segment_k
+                    buckets.setdefault(b_idx, []).append(p)
+
+                earliest_bucket_idx = min(buckets.keys())
+                bucket_candidates = buckets[earliest_bucket_idx]
+
+                candidate_freqs = {p: available_pieces[p] for p in bucket_candidates}
+                min_freq = min(candidate_freqs.values())
+                rarest_in_bucket = [p for p, count in candidate_freqs.items() if count == min_freq]
+
+                chosen_piece = random.choice(rarest_in_bucket)
+                target_peer = random.choice(peer_map[chosen_piece])
+       
         # dispatch task if a valid piece and peer target were selected
         if chosen_piece is not None and target_peer is not None:
             sim.start_transfer(
@@ -252,12 +301,12 @@ def run_benchmark(strategy_name):
 
     # Seed
     seeder = Peer(peer_id=0, upload_speed_mbps=10)
-    seeder.completed_pieces = set(range(20))
+    seeder.completed_pieces = set(range(200))
 
     # 4 Leechers
     leechers = []
     prev_peer = seeder
-    for i in range(1, 5):
+    for i in range(1, 100):
         p = Peer(peer_id=i, strategy=strategy_name, download_speed_mbps=10, upload_speed_mbps=10)
         
         if strategy_name == "cascading":
@@ -288,7 +337,7 @@ def run_benchmark(strategy_name):
 if __name__=="__main__":
     # Execute comparisons
     results = {}
-    strats = ["rarest_random", "sequential", "cascading"]
+    strats = ["rarest_random", "sequential", "cascading", "hybrid", "segment_random"]
     for strat in strats:
         print(f"STRAT: {strat}")
         results[strat] = run_benchmark(strat)
