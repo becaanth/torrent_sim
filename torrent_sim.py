@@ -4,9 +4,19 @@ from collections import Counter
 
 import pdb
 
+class Swarm:
+    """Represents a single torrent session"""
+    def __init__(self, torrent_id, initial_pieces=10, piece_size_mb=1):
+        self.torrent_id = torrent_id
+        self.published_pieces = initial_pieces
+        self.piece_size_mb = piece_size_mb
+        self.is_finalized = False # flag for closing the stream
+        self.participants = set()
+
 class Transfer:
-    def __init__(self, transfer_id, downloader, uploader, piece_id, total_size_mb):
+    def __init__(self, transfer_id, torrent_id, downloader, uploader, piece_id, total_size_mb):
         self.transfer_id = transfer_id
+        self.torrent_id = torrent_id
         self.downloader = downloader
         self.uploader = uploader
         self.piece_id = piece_id
@@ -16,21 +26,24 @@ class Transfer:
         self.scheduled_finish_time = float('inf')
         
 class TorrentSim:
-    def __init__(self, initial_pieces=10, piece_size_mb=1):
-        self.published_pieces = initial_pieces
-        self.piece_size_mb = piece_size_mb
-        self.is_finalized = False # flag for closing the stream
+    """Operates as the global discrete event engine and network manager"""
+    def __init__(self):
+        self.swarms = {}
         self.time = 0.0
         self.counter = 0  # Unique tie-breaker sequence number
         self.transfer_counter = 0
         self.event_queue = []  # (time, event_type, peer, data)
         self.active_transfers = set()
+        self.agents = []
 
-    def schedule(self, delay, event_type, peer, data=None):
+    def add_swarm(self, swarm):
+        self.swarms[swarm.torrent_id] = swarm
+
+    def schedule(self, delay, event_type, agent, data=None):
         self.counter += 1
         heapq.heappush(
             self.event_queue, 
-            (self.time + delay, self.counter, event_type, peer, data)
+            (self.time + delay, self.counter, event_type, agent, data)
         )
 
     def _update_transfer_progress(self):
@@ -64,11 +77,16 @@ class TorrentSim:
                 # push updated finish time to event queue
                 self.schedule(time_to_complete, "PIECE_COMPLETE", t.downloader, data=t)
 
-    def start_transfer(self, downloader, uploader, piece_id):
+    def start_transfer(self, downloader, uploader, torrent_id, piece_id):
         self.transfer_counter += 1
-        transfer = Transfer(self.transfer_counter, downloader, uploader, piece_id, self.piece_size_mb)
+        swarm = self.swarms[torrent_id]
+        transfer = Transfer(
+            self.transfer_counter, torrent_id, 
+            downloader, uploader, 
+            piece_id, swarm.piece_size_mb
+        )
 
-        downloader.downloading_pieces.add(piece_id)
+        downloader.downloading_pieces[torrent_id].add(piece_id)
         downloader.active_downloads.add(transfer)
         uploader.active_uploads.add(transfer)
         self.active_transfers.add(transfer)
@@ -76,59 +94,65 @@ class TorrentSim:
         self.recalculate_bandwidth()
 
     def finish_transfer(self, transfer):
+        t_id = transfer.torrent_id
         self.active_transfers.remove(transfer)
         transfer.downloader.active_downloads.remove(transfer)
         transfer.uploader.active_uploads.remove(transfer)
-        transfer.downloader.downloading_pieces.remove(transfer.piece_id)
-        transfer.downloader.completed_pieces.add(transfer.piece_id)
+
+        transfer.downloader.downloading_pieces[t_id].remove(transfer.piece_id)
+        transfer.downloader.completed_pieces[t_id].add(transfer.piece_id)
 
         # record metrics
-        transfer.downloader.record_useful_chunks(self)
+        transfer.downloader.record_useful_chunks(self,t_id)
 
-        # wake up idle neighbours now that a new piece is available
-        for neighbour in transfer.downloader.neighbours:
-            if not neighbour.active_downloads:
-                self.schedule(0.0, "PICK_PIECE", neighbour)
+        # # wake up idle neighbours now that a new piece is available
+        # for neighbour in transfer.downloader.neighbours:
+        #     if not neighbour.active_downloads:
+        #         self.schedule(0.0, "PICK_PIECE", neighbour)
 
         self.recalculate_bandwidth()
 
-    def append_pieces(self, count, publisher_peer):
+    def append_pieces(self, torrent_id, count, publisher_agent):
         """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
-        new_start = self.published_pieces
-        self.published_pieces += count
-        new_pieces = set(range(new_start, self.published_pieces))
+        swarm = self.swarms[torrent_id]
+        new_start = swarm.published_pieces
+        swarm.published_pieces += count
+        new_pieces = set(range(new_start, swarm.published_pieces))
 
-        publisher_peer.completed_pieces.update(new_pieces)
-        print(f"[Time {self.time:6.2f}s] APPEND: +{count} pieces added. "
-              f"New stream horizon: [0 .. {self.published_pieces - 1}]")
+        publisher_agent.completed_pieces[torrent_id].update(new_pieces)
+        print(f"[Time {self.time:6.2f}s] APPEND: Swarm '{torrent_id}' +{count} pieces added. "
+              f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
 
         # wake up idle leechers
-        for peer in self.peers:
-            if peer != publisher_peer and not peer.active_downloads:
-                self.schedule(0.0, "PICK_PIECE", peer)
+        for agent in swarm.participants:
+            if agent != publisher_agent: 
+                self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
 
-    def finalize_stream(self):
+    def finalize_stream(self, torrent_id):
         """Mark the stream as complete"""
-        self.is_finalized = True
-        print(f"[Time {self.time:6.2f}s] FINALIZE: Stream closed at {self.published_pieces} total pieces.")
+        swarm = self.swarms[torrent_id]
+        swarm.is_finalized = True
+        print(f"[Time {self.time:6.2f}s] FINALIZE: Swarm '{torrent_id}': Closed at {swarm.published_pieces} total pieces.")
 
         # Trigger idle leechers to evaluate total completion
-        for peer in self.peers:
-            if not peer.active_downloads:
-                self.schedule(0.0, "PICK_PIECE", peer)
+        for agent in swarm.participants:
+            self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
         
     def run(self):
         while self.event_queue:
-            self.time, _, event_type, peer, data = heapq.heappop(self.event_queue)
+            self.time, _, event_type, agent, data = heapq.heappop(self.event_queue)
+
             if event_type == "PICK_PIECE":
-                peer.pick_next_piece(self)
+                torrent_id = data
+                agent.pick_next_piece(self, torrent_id)
 
             elif event_type == "APPEND_PIECES":
-                count, publisher = data
-                self.append_pieces(count, publisher)
+                torrent_id, count = data
+                agent.append_pieces(self, count, torrent_id)
 
             elif event_type == "FINALIZE_STREAM":
-                self.finalize_stream()
+                torrent_id = data
+                self.finalize_stream(torrent_id)
 
             elif event_type == "PIECE_COMPLETE":
                 transfer = data
@@ -137,117 +161,154 @@ class TorrentSim:
                     continue
 
                 if transfer in self.active_transfers:
+                    t_id = transfer.torrent_id
+                    swarm = self.swarms[t_id]
                     self.finish_transfer(transfer)
-                    print(f"[Time {self.time:6.2f}s] Peer {peer.peer_id:2d} got piece {transfer.piece_id:2d} "
-                          f"from Peer {transfer.uploader.peer_id:2d} "
-                          f"({len(peer.completed_pieces)}/{self.published_pieces} complete)")
 
-                    if len(peer.completed_pieces) == self.published_pieces:
-                        peer.finish_time = self.time
+                    if len(agent.completed_pieces[t_id]) == swarm.published_pieces and swarm.is_finalized:
+                        if agent.finish_time[t_id] is None:
+                            agent.finish_time[t_id] = self.time
+                            print(f"[Time {self.time:6.2f}s] Agent {agent.agent_id:2d} "
+                                  f"COMPLETED Swarm '{t_id}' ({swarm.published_pieces}/{swarm.published_pieces})")
                     else:
-                        # Immediately attempt to request next piece
-                        self.schedule(0.0, "PICK_PIECE", peer)
+                        self.schedule(0.0, "PICK_PIECE", agent, data=t_id)
 
-class Peer:
-    def __init__(self, peer_id, download_speed_mbps=10, upload_speed_mbps=10, 
-                 strategy="rarest_random", hybrid_s=0.5, segment_k=20, upstream_peer=None):
-        self.peer_id = peer_id
+class Agent:
+    """all agents in a swarm"""
+    def __init__(self, agent_id, download_speed_mbps=10, upload_speed_mbps=10):
+        self.agent_id = agent_id
         self.download_speed = download_speed_mbps
         self.upload_speed = upload_speed_mbps
-        self.strategy = strategy # "rarest_random", "sequential", "cascading", "hybrid", "segment_random"
-        self.hybrid_s = hybrid_s
-        self.segment_k = segment_k
-
-        self.completed_pieces = set()
-        self.downloading_pieces = set()
-        self.neighbours = []
 
         # continuous time tracking sets
         self.active_uploads = set()
         self.active_downloads = set()
-        self.upstream_peer = None
 
-        # metrics
-        self.start_time = None
-        self.finish_time = None
-        self.u_x_history = [] # history of useful chunks
-        self.r_bar_snapshots = [] # history of robustness
+        # state dicts keyed by torrent_id
+        self.completed_pieces = {}
+        self.downloading_pieces = {}
+        self.neighbours = {}
+        self.strategies = {}
+        self.upstream_peers = {}
 
-    def connect(self, other_peer):
-        if other_peer not in self.neighbours:
-            self.neighbours.append(other_peer)
-        if self not in other_peer.neighbours:
-            other_peer.neighbours.append(self)
+        # metrics per swarm
+        self.start_time = {}
+        self.finish_time = {}
+        self.u_x_history = {} # history of useful chunks
+        self.r_bar_snapshots = {} # history of robustness
 
-    def record_useful_chunks(self, sim):
+    def join_swarm(self, swarm, strategy="rarest_random", hybrid_s=0.5, segment_k=5, upstream_peer=None, is_seeder=False):
+        t_id = swarm.torrent_id
+        swarm.participants.add(self)
+
+        self.completed_pieces[t_id] = set(range(swarm.published_pieces)) if is_seeder else set()
+        self.downloading_pieces[t_id] = set()
+        self.neighbours[t_id] = []
+        self.strategies[t_id] = {
+            "strategy": strategy,
+            "hybrid_s": hybrid_s,
+            "segment_k": segment_k
+        }
+        self.upstream_peers[t_id] = upstream_peer
+
+        self.start_time[t_id] = None
+        self.finish_time[t_id] = None
+        self.u_x_history[t_id] = []
+        self.r_bar_snapshots[t_id] = []
+
+    def connect(self, other_agent, torrent_id):
+        if other_agent not in self.neighbours[torrent_id]:
+            self.neighbours[torrent_id].append(other_agent)
+        if self not in other_agent.neighbours[torrent_id]:
+            other_agent.neighbours[torrent_id].append(self)
+
+    def record_useful_chunks(self, sim, torrent_id):
         """U(x) per Eq. 10 in Fan et al."""
-        x = len(self.completed_pieces)
+        completed = self.completed_pieces[torrent_id]
+        x = len(completed)
         contiguous_len = 0
-        while contiguous_len in self.completed_pieces:
+        while contiguous_len in completed:
             contiguous_len += 1
 
         u_x = contiguous_len / x if x > 0 else 0.0
-        self.u_x_history.append(u_x)
+        self.u_x_history[torrent_id].append(u_x)
 
-        r_bar = self.compute_current_r_bar(sim)
-        self.r_bar_snapshots.append(r_bar)
+        r_bar = self.compute_current_r_bar(sim,torrent_id)
+        self.r_bar_snapshots[torrent_id].append(r_bar)
 
-    def compute_current_r_bar(self, sim):
+    def compute_current_r_bar(self, sim, torrent_id):
         """r_bar per Eq. 8 in Fan et al."""
+        swarm = sim.swarms[torrent_id]
+        if swarm.published_pieces == 0:
+            return 0.0
         r_i_sum = 0
-        for p in range(sim.published_pieces):
-            if self.strategy == "cascading":
-                if self.upstream_peer and p in self.upstream_peer.completed_pieces:
+        strat = self.strategies[torrent_id]["strategy"]
+        for p in range(swarm.published_pieces):
+            if strat == "cascading":
+                upstream = self.upstream_peers.get(torrent_id)
+                if upstream and p in upstream.completed_pieces[torrent_id]:
                     r_i_sum += 1
             else:
-                r_i_sum += sum(1 for n in self.neighbours if p in n.completed_pieces)
-        return r_i_sum / sim.published_pieces
+                r_i_sum += sum(1 for n in self.neighbours[torrent_id] if p in n.completed_pieces[torrent_id])
+        return r_i_sum / swarm.published_pieces
 
-    def get_metrics(self, sim, p_error=0.5):
+    def get_metrics(self, sim, torrent_id, p_error=0.5):
         """Return Throughput [Mbps], Sequentiality [0..1], Robustness [0..1]"""
-        if self.start_time is None or self.finish_time is None:
+        swarm = sim.swarms[torrent_id]
+        start = self.start_time.get(torrent_id)
+        finish = self.finish_time.get(torrent_id)
+        if start is None or finish is None:
             return 0.0,0.0,0.0
 
         # throughput
-        duration = self.finish_time - self.start_time
-        file_size_bits = sim.published_pieces * sim.piece_size_mb * 8.0
+        duration = finish - start
+        file_size_bits = len(self.completed_pieces[torrent_id]) * swarm.piece_size_mb * 8.0
         throughput = file_size_bits / duration if duration > 0 else 0.0
 
         # sequentiality (eq. 10)
-        sequentiality = sum(self.u_x_history) / sim.published_pieces if self.u_x_history else 0.0
+        hist = self.u_x_history.get(torrent_id, [])
+        sequentiality = sum(hist) / swarm.published_pieces if hist else 0.0
 
         # robustness (eq. 8)
-        avg_r_bar = sum(self.r_bar_snapshots) / len(self.r_bar_snapshots) if self.r_bar_snapshots else 0.0
+        r_snaps = self.r_bar_snapshots.get(torrent_id, [])
+        avg_r_bar = sum(r_snaps) / len(r_snaps) if r_snaps else 0.0
         robustness = 1.0 - (p_error ** avg_r_bar)
 
         return throughput, sequentiality, robustness
 
-    def pick_next_piece(self, sim):
-        if self.start_time is None:
-            self.start_time = sim.time
-
-        # prevent overlapping transfers
-        if self.active_downloads:
+    def pick_next_piece(self, sim, torrent_id):
+        if torrent_id not in self.completed_pieces:
             return
 
-        missing = set(range(sim.published_pieces)) - self.completed_pieces - self.downloading_pieces
+        if self.start_time[torrent_id] is None:
+            self.start_time[torrent_id] = sim.time
+
+        swarm = sim.swarms[torrent_id]
+        missing = set(range(swarm.published_pieces)) - self.completed_pieces[torrent_id] - self.downloading_pieces[torrent_id]
         if not missing:
             # Handle stream completion if finalized while idle
-            if len(self.completed_pieces) == sim.published_pieces and sim.is_finalized and self.finish_time is None:
-                self.finish_time = sim.time
-                print(f"[Time {sim.time:6.2f}s] Peer {self.peer_id:2d} ({self.strategy:14s}) "
-                      f"COMPLETED full stream ({sim.published_pieces}/{sim.published_pieces})")
+            if len(self.completed_pieces[torrent_id]) == swarm.published_pieces and swarm.is_finalized and self.finish_time is None:
+                if self.finish_time[torrent_id] is None:
+                    self.finish_time[torrent_id] = sim.time
+                    print(f"[Time {sim.time:6.2f}s] Agent {self.agent_id:2d}"
+                        f"COMPLETED full Swarm '{torrent_id}' ({swarm.published_pieces}/{swarm.published_pieces})")
             return
 
+        strat_info = self.strategies[torrent_id]
+        strategy = strat_info["strategy"]
+        hybrid_s = strat_info["hybrid_s"]
+        segment_k = strat_info["segment_k"]
+
         chosen_piece = None
-        target_peer = None
+        target_agent = None
+        neighbours = self.neighbours[torrent_id]
 
         # RAREST-RANDOM
-        if self.strategy == "rarest_random":
+        if strategy == "rarest_random":
             available_pieces = Counter()
             peer_map = {} # piece_id -> list of peers who have it
-            for n in self.neighbours:
-                for p in n.completed_pieces:
+            for n in neighbours:
+                for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
                         peer_map.setdefault(p, []).append(n)
@@ -256,57 +317,58 @@ class Peer:
                 min_freq = min(available_pieces.values())
                 rarest_candidates = [p for p, count in available_pieces.items() if count == min_freq]
                 chosen_piece = random.choice(rarest_candidates)
-                target_peer = random.choice(peer_map[chosen_piece])
+                target_agent = random.choice(peer_map[chosen_piece])
 
         # SEQUENTIAL
-        elif self.strategy == "sequential":
+        elif strategy == "sequential":
             available_pieces = set()
             peer_map = {}
-            for n in self.neighbours:
-                for p in n.completed_pieces:
+            for n in neighbours:
+                for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces.add(p)
                         peer_map.setdefault(p, []).append(n)
 
             if available_pieces:
                 chosen_piece = min(available_pieces)
-                target_peer = random.choice(peer_map[chosen_piece])
+                target_agent = random.choice(peer_map[chosen_piece])
 
         # CASCADING
-        elif self.strategy == "cascading":
+        elif strategy == "cascading":
             # check if current bound target peer still has missing pieces to offer
-            if self.upstream_peer is not None:
-                available = self.upstream_peer.completed_pieces & missing
+            upstream = self.upstream_peers.get(torrent_id)
+            if upstream is not None:
+                available = upstream.completed_pieces[torrent_id] & missing
                 if available:
                     chosen_piece = min(available)
-                    target_peer = self.upstream_peer
+                    target_agent = upstream
 
         # HYBRID (sequential w/ prob s, random w/ prob 1-s)
-        elif self.strategy == 'hybrid':
+        elif strategy == 'hybrid':
             available_pieces = Counter()
             peer_map = {}
-            for n in self.neighbours:
-                for p in n.completed_pieces:
+            for n in neighbours:
+                for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
                         peer_map.setdefault(p, []).append(n)
 
             if available_pieces:
-                if random.random() < self.hybrid_s:
+                if random.random() < hybrid_s:
                     chosen_piece = min(available_pieces.keys())
                 else:
                     min_freq = min(available_pieces.values())
                     rarest = [p for p, count in available_pieces.items() if count == min_freq]
                     chosen_piece = random.choice(rarest)
 
-                target_peer = random.choice(peer_map[chosen_piece])
+                target_agent = random.choice(peer_map[chosen_piece])
 
         # SEGMENT-RANDOM (bucket sequential, intra-bucket random)
-        elif self.strategy == 'segment_random':
+        elif strategy == 'segment_random':
             available_pieces = Counter()
             peer_map = {}
-            for n in self.neighbours:
-                for p in n.completed_pieces:
+            for n in neighbours:
+                for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
                         peer_map.setdefault(p, []).append(n)
@@ -314,7 +376,7 @@ class Peer:
             if available_pieces:
                 buckets = {}
                 for p in available_pieces:
-                    b_idx = p // self.segment_k
+                    b_idx = p // segment_k
                     buckets.setdefault(b_idx, []).append(p)
 
                 earliest_bucket_idx = min(buckets.keys())
@@ -325,13 +387,14 @@ class Peer:
                 rarest_in_bucket = [p for p, count in candidate_freqs.items() if count == min_freq]
 
                 chosen_piece = random.choice(rarest_in_bucket)
-                target_peer = random.choice(peer_map[chosen_piece])
+                target_agent = random.choice(peer_map[chosen_piece])
        
         # dispatch task if a valid piece and peer target were selected
-        if chosen_piece is not None and target_peer is not None:
+        if chosen_piece is not None and target_agent is not None:
             sim.start_transfer(
                 downloader=self,
-                uploader=target_peer,
+                uploader=target_agent,
+                torrent_id=torrent_id,
                 piece_id=chosen_piece
             )
 
@@ -426,44 +489,73 @@ def run_mutable_benchmark(strategy_name, hybrid_s=0.5, segment_k=4):
     return t_avg, s_avg, r_avg
 
 if __name__=="__main__":
-    # Execute standard comparisons
-    # results = {}
-    # strats = ["rarest_random", "sequential", "cascading", "hybrid", "segment_random"]
-    # for strat in strats:
-    #     print(f"STRAT: {strat}")
-    #     results[strat] = run_benchmark(strat)
-
-    # print(f"{'Strategy':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
-    # print("-" * 72)
-    # for strat, (t, s, r) in results.items():
-    #     print(f"{strat:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
-
-    # execute mutable comparisons
-
 # Compare strategies in mutable stream scenario
-    print("=" * 80)
-    print("MUTABLE TORRENT SIMULATION TRACE & BENCHMARK")
-    print("=" * 80)
+    sim = TorrentSim()
 
-    strategies = [
-        ("rarest_random", {}),
-        ("sequential", {}),
-        ("cascading", {}),
-        ("hybrid (s=0.5)", {"hybrid_s": 0.5}),
-        ("segment_random (K=4)", {"segment_k": 4}),
-    ]
+    # Swarm A: Video on Demand Stream (10 pieces)
+    swarm_vod = Swarm("Movie_Stream", initial_pieces=10, piece_size_mb=1)
 
-    results = {}
-    for label, kwargs in strategies:
-        strat_type = label.split()[0]
-        t, s, r = run_mutable_benchmark(strat_type, **kwargs)
-        results[label] = (t, s, r)
+    # Swarm B: Operating System ISO (10 pieces)
+    swarm_iso = Swarm("OS_ISO", initial_pieces=10, piece_size_mb=1)
 
+    sim.add_swarm(swarm_vod)
+    sim.add_swarm(swarm_iso)
+
+    # 6 Physical Agents (10 Mbps network interfaces)
+    agents = [Agent(agent_id=i, download_speed_mbps=10, upload_speed_mbps=10) for i in range(6)]
+    sim.agents = agents
+
+    # --- SWARM A ("Movie_Stream") SETUP ---
+    # Agent 0 is Seeder
+    agents[0].join_swarm(swarm_vod, is_seeder=True)
+    # Agents 1, 2, 3 are Leechers
+    agents[1].join_swarm(swarm_vod, strategy="sequential")
+    agents[2].join_swarm(swarm_vod, strategy="segment_random", segment_k=3)
+    agents[3].join_swarm(swarm_vod, strategy="rarest_random")
+
+    # Connect overlay graph for Movie_Stream
+    for leecher_id in [1, 2, 3]:
+        agents[0].connect(agents[leecher_id], "Movie_Stream")
+        for other_id in [1, 2, 3]:
+            if leecher_id != other_id:
+                agents[leecher_id].connect(agents[other_id], "Movie_Stream")
+
+    # --- SWARM B ("OS_ISO") SETUP ---
+    # Agent 4 is Seeder
+    agents[4].join_swarm(swarm_iso, is_seeder=True)
+    # Agents 1, 2, 5 are Leechers (Agents 1 & 2 overlap with Movie_Stream!)
+    agents[1].join_swarm(swarm_iso, strategy="rarest_random")
+    agents[2].join_swarm(swarm_iso, strategy="hybrid", hybrid_s=0.5)
+    agents[5].join_swarm(swarm_iso, strategy="rarest_random")
+
+    # Connect overlay graph for OS_ISO
+    for leecher_id in [1, 2, 5]:
+        agents[4].connect(agents[leecher_id], "OS_ISO")
+        for other_id in [1, 2, 5]:
+            if leecher_id != other_id:
+                agents[leecher_id].connect(agents[other_id], "OS_ISO")
+
+    # Schedule Swarm initializations
+    for a in [agents[1], agents[2], agents[3]]:
+        sim.schedule(0.0, "PICK_PIECE", a, data="Movie_Stream")
+
+    for a in [agents[1], agents[2], agents[5]]:
+        sim.schedule(0.0, "PICK_PIECE", a, data="OS_ISO")
+
+    # Finalize streams
+    sim.schedule(0.0, "FINALIZE_STREAM", agents[0], data="Movie_Stream")
+    sim.schedule(0.0, "FINALIZE_STREAM", agents[4], data="OS_ISO")
+
+    sim.run()
+
+    # Display Per-Swarm Metrics
     print("\n" + "=" * 80)
-    print(f"{'Strategy Config':<23} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
+    print(f"{'Agent ID':<10} | {'Swarm ID':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
     print("-" * 80)
 
-    for label, (t, s, r) in results.items():
-        print(f"{label:<23} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
-
+    for agent in agents:
+        for t_id in agent.completed_pieces:
+            if agent.start_time.get(t_id) is not None and agent.finish_time.get(t_id) is not None:
+                t, s, r = agent.get_metrics(sim, t_id)
+                print(f"Agent {agent.agent_id:<4} | {t_id:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
         
