@@ -2,6 +2,8 @@ import heapq
 import random
 from collections import Counter
 
+import pdb
+
 class Transfer:
     def __init__(self, transfer_id, downloader, uploader, piece_id, total_size_mb):
         self.transfer_id = transfer_id
@@ -79,6 +81,14 @@ class TorrentSim:
         transfer.downloader.downloading_pieces.remove(transfer.piece_id)
         transfer.downloader.completed_pieces.add(transfer.piece_id)
 
+        # record metrics
+        transfer.downloader.record_useful_chunks(self)
+
+        # wake up idle neighbours now that a new piece is available
+        for neighbour in transfer.downloader.neighbours:
+            if not neighbour.active_downloads:
+                self.schedule(0.0, "PICK_PIECE", neighbour)
+
         self.recalculate_bandwidth()
 
     def run(self):
@@ -98,9 +108,12 @@ class TorrentSim:
                     print(f"[Time {self.time:6.2f}s] Peer {peer.peer_id:2d} got piece {transfer.piece_id:2d} "
                           f"from Peer {transfer.uploader.peer_id:2d} "
                           f"({len(peer.completed_pieces)}/{self.num_pieces} complete)")
-                    
-                    # Immediately attempt to request next piece
-                    self.schedule(0.0, "PICK_PIECE", peer)
+
+                    if len(peer.completed_pieces) == self.num_pieces:
+                        peer.finish_time = self.time
+                    else:
+                        # Immediately attempt to request next piece
+                        self.schedule(0.0, "PICK_PIECE", peer)
 
 class Peer:
     def __init__(self, peer_id, download_speed_mbps=10, upload_speed_mbps=10, strategy="rarest_random", upstream_peer=None):
@@ -117,13 +130,69 @@ class Peer:
         self.active_downloads = set()
         self.upstream_peer = None
 
+        # metrics
+        self.start_time = None
+        self.finish_time = None
+        self.u_x_history = [] # history of useful chunks
+        self.r_bar_snapshots = [] # history of robustness
+
     def connect(self, other_peer):
         if other_peer not in self.neighbours:
             self.neighbours.append(other_peer)
         if self not in other_peer.neighbours:
             other_peer.neighbours.append(self)
 
+    def record_useful_chunks(self, sim):
+        """U(x) per Eq. 10 in Fan et al."""
+        x = len(self.completed_pieces)
+        contiguous_len = 0
+        while contiguous_len in self.completed_pieces:
+            contiguous_len += 1
+
+        u_x = contiguous_len / x if x > 0 else 0.0
+        self.u_x_history.append(u_x)
+
+        r_bar = self.compute_current_r_bar(sim)
+        self.r_bar_snapshots.append(r_bar)
+
+    def compute_current_r_bar(self, sim):
+        """r_bar per Eq. 8 in Fan et al."""
+        r_i_sum = 0
+        for p in range(sim.num_pieces):
+            if self.strategy == "cascading":
+                if self.upstream_peer and p in self.upstream_peer.completed_pieces:
+                    r_i_sum += 1
+            else:
+                r_i_sum += sum(1 for n in self.neighbours if p in n.completed_pieces)
+        return r_i_sum / sim.num_pieces
+
+    def get_metrics(self, sim, p_error=0.5):
+        """Return Throughput [Mbps], Sequentiality [0..1], Robustness [0..1]"""
+        if self.start_time is None or self.finish_time is None:
+            return 0.0,0.0,0.0
+
+        # throughput
+        duration = self.finish_time - self.start_time
+        file_size_bits = sim.num_pieces * sim.piece_size_mb * 8.0
+        throughput = file_size_bits / duration if duration > 0 else 0.0
+
+        # sequentiality (eq. 10)
+        sequentiality = sum(self.u_x_history) / sim.num_pieces if self.u_x_history else 0.0
+
+        # robustness (eq. 8)
+        avg_r_bar = sum(self.r_bar_snapshots) / len(self.r_bar_snapshots) if self.r_bar_snapshots else 0.0
+        robustness = 1.0 - (p_error ** avg_r_bar)
+
+        return throughput, sequentiality, robustness
+
     def pick_next_piece(self, sim):
+        if self.start_time is None:
+            self.start_time = sim.time
+
+        # prevent overlapping transfers
+        if self.active_downloads:
+            return
+
         missing = set(range(sim.num_pieces)) - self.completed_pieces - self.downloading_pieces
         if not missing:
             return
@@ -165,50 +234,66 @@ class Peer:
         elif self.strategy == "cascading":
             # check if current bound target peer still has missing pieces to offer
             if self.upstream_peer is not None:
-                available_from_upstream = self.upstream_peer.completed_pieces & missing
-                if not available_from_upstream:
-                    chosen_piece = min(available_from_upstream)
+                available = self.upstream_peer.completed_pieces & missing
+                if available:
+                    chosen_piece = min(available)
                     target_peer = self.upstream_peer
 
-        # dispatch tash if a valid piece and peer target were selected
+        # dispatch task if a valid piece and peer target were selected
         if chosen_piece is not None and target_peer is not None:
             sim.start_transfer(
                 downloader=self,
                 uploader=target_peer,
                 piece_id=chosen_piece
             )
-            # self.downloading_pieces.add(chosen_piece)
+
+def run_benchmark(strategy_name):
+    sim = TorrentSim(num_pieces=20, piece_size_mb=1)  # 20 MB total file
+
+    # Seed
+    seeder = Peer(peer_id=0, upload_speed_mbps=10)
+    seeder.completed_pieces = set(range(20))
+
+    # 4 Leechers
+    leechers = []
+    prev_peer = seeder
+    for i in range(1, 5):
+        p = Peer(peer_id=i, strategy=strategy_name, download_speed_mbps=10, upload_speed_mbps=10)
         
-            # Calculate simulated latency/transfer time without actual file payload
-            # effective_speed = min(self.download_speed, 10.0)  # assumes neighbor cap
-            # transfer_time = (sim.piece_size_mb * 8) / effective_speed
-            # sim.schedule(transfer_time, "PIECE_COMPLETE", self, data=chosen_piece)
+        if strategy_name == "cascading":
+            p.upstream_peer = prev_peer
+            p.connect(prev_peer)
+            prev_peer = p
+        else:
+            seeder.connect(p)
+            for existing in leechers:
+                existing.connect(p)
+                
+        leechers.append(p)
 
-    def on_piece_received(self, sim, piece_id):
-        self.downloading_pieces.remove(piece_id)
-        self.completed_pieces.add(piece_id)
-        print(f"[Time {sim.time:.2f}s] Peer {self.peer_id} finished piece {piece_id} ({len(self.completed_pieces)}/{sim.num_pieces})")
-        
-        # Immediately pick the next piece
-        sim.schedule(0.0, "PICK_PIECE", self)
+    sim.peers = leechers
 
+    for p in leechers:
+        sim.schedule(0.0, "PICK_PIECE", p)
 
-# Simulation Setup
-sim = TorrentSim(num_pieces=10, piece_size_mb=2)
+    sim.run()
 
-# Seeder with 10 Mbps upload capacity
-seeder = Peer(peer_id=0, upload_speed_mbps=10)
-seeder.completed_pieces = set(range(10))
+    # Collect average metrics across leechers
+    t_avg = sum(p.get_metrics(sim)[0] for p in leechers) / len(leechers)
+    s_avg = sum(p.get_metrics(sim)[1] for p in leechers) / len(leechers)
+    r_avg = sum(p.get_metrics(sim)[2] for p in leechers) / len(leechers)
 
-# Leechers with 10 Mbps download capacity
-leecher_a = Peer(peer_id=1, strategy="rarest_random", download_speed_mbps=10)
-leecher_b = Peer(peer_id=2, strategy="rarest_random", download_speed_mbps=10)
+    return t_avg, s_avg, r_avg
 
-seeder.connect(leecher_a)
-seeder.connect(leecher_b)
+if __name__=="__main__":
+    # Execute comparisons
+    results = {}
+    strats = ["rarest_random", "sequential", "cascading"]
+    for strat in strats:
+        print(f"STRAT: {strat}")
+        results[strat] = run_benchmark(strat)
 
-# Start Leecher A at 0s, Leecher B joins at 0.5s
-sim.schedule(0.0, "PICK_PIECE", leecher_a)
-sim.schedule(0.5, "PICK_PIECE", leecher_b)
-
-sim.run()
+    print(f"{'Strategy':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
+    print("-" * 72)
+    for strat, (t, s, r) in results.items():
+        print(f"{strat:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
