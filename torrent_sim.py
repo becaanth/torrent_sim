@@ -1,5 +1,6 @@
 import heapq
 import random
+import math
 from collections import Counter
 
 import pdb
@@ -27,7 +28,7 @@ class Transfer:
         
 class TorrentSim:
     """Operates as the global discrete event engine and network manager"""
-    def __init__(self):
+    def __init__(self, c_max=10.0, d0=10.0, gamma=2.0):
         self.swarms = {} # torrent_id -> swarm
         self.time = 0.0
         self.counter = 0  # Unique tie-breaker sequence number
@@ -36,9 +37,24 @@ class TorrentSim:
         self.active_transfers = set()
         self.agents = []
 
+        # spatial channel params
+        self.c_max = c_max # max radio throughput
+        self.d0 = d0
+        self.gamma = gamma
+
     # world-level setup
     def add_swarm(self, swarm):
         self.swarms[swarm.torrent_id] = swarm
+
+    def compute_link_capacity(self, agent_a, agent_b):
+        """radio capacity as a function of distance"""
+        dx = agent_a.position[0] - agent_b.position[0]
+        dy = agent_a.position[1] - agent_b.position[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        # path-loss attenuation
+        capacity = self.c_max / (1.0 + (dist/self.d0)**self.gamma)
+        return dist, capacity
 
     def schedule(self, delay, event_type, agent, data=None):
         self.counter += 1
@@ -69,8 +85,10 @@ class TorrentSim:
             uploader_share = t.uploader.upload_speed / len(t.uploader.active_uploads)
             downloader_share = t.downloader.download_speed / len(t.downloader.active_downloads)
 
+            _, link_cap = self.compute_link_capacity(t.uploader, t.downloader)
+
             # bottleneck rate for this transfer
-            t.current_rate_mbps = min(uploader_share, downloader_share)
+            t.current_rate_mbps = min(uploader_share, downloader_share, link_cap)
 
             if t.current_rate_mbps > 0:
                 remaining_bits = t.remaining_mb * 8.0
@@ -181,8 +199,9 @@ class TorrentSim:
 
 class Agent:
     """all agents in a swarm"""
-    def __init__(self, agent_id, download_speed_mbps=10, upload_speed_mbps=10):
+    def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10):
         self.agent_id = agent_id
+        self.position = position # (x,y)
         self.download_speed = download_speed_mbps
         self.upload_speed = upload_speed_mbps
 
@@ -414,66 +433,58 @@ class Agent:
             )
 
 if __name__=="__main__":
-    sim = TorrentSim()
+    sim = TorrentSim(c_max=10.0, d0=10.0, gamma=2.0)
 
+    # Instantiate Swarm
     swarm_vod = Swarm("Movie_Stream", initial_pieces=6, piece_size_mb=1)
-    swarm_iso = Swarm("OS_ISO", initial_pieces=4, piece_size_mb=1)
-
     sim.add_swarm(swarm_vod)
-    sim.add_swarm(swarm_iso)
 
-    agents = [Agent(agent_id=i, download_speed_mbps=10, upload_speed_mbps=10) for i in range(6)]
+    # Create 4 Spatial Robot Agents positioned along the X-axis
+    agents = [
+        Agent(agent_id=0, position=(0.0, 0.0)),   # Seeder at origin
+        Agent(agent_id=1, position=(5.0, 0.0)),   # 5m away
+        Agent(agent_id=2, position=(15.0, 0.0)),  # 15m away
+        Agent(agent_id=3, position=(30.0, 0.0))   # 30m away
+    ]
     sim.agents = agents
 
-    # --- SWARM A: Cascading Pipeline (Agent 0 -> Agent 1 -> Agent 2 -> Agent 3) ---
+    # Join Swarm in Cascading chain: 0 -> 1 -> 2 -> 3
     agents[0].join_swarm(swarm_vod, is_seeder=True)
-    agents[1].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[0])
-    agents[2].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[1])
-    agents[3].join_swarm(swarm_vod, strategy="cascading", upstream_peer=agents[2])
+    agents[1].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[0])
+    agents[2].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[1])
+    agents[3].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[2])
 
     agents[0].connect(agents[1], "Movie_Stream")
     agents[1].connect(agents[2], "Movie_Stream")
     agents[2].connect(agents[3], "Movie_Stream")
 
-    # --- SWARM B: Mesh Swarm ---
-    agents[4].join_swarm(swarm_iso, is_seeder=True)
-    agents[1].join_swarm(swarm_iso, strategy="cascading")            # Agent 1 in BOTH swarms
-    agents[2].join_swarm(swarm_iso, strategy="cascading", hybrid_s=0.5)     # Agent 2 in BOTH swarms
-    agents[5].join_swarm(swarm_iso, strategy="cascading")
-
-    for leecher_id in [1, 2, 5]:
-        agents[4].connect(agents[leecher_id], "OS_ISO")
-        for other_id in [1, 2, 5]:
-            if leecher_id != other_id:
-                agents[leecher_id].connect(agents[other_id], "OS_ISO")
-
     # Schedule initial pick events
     for a in [agents[1], agents[2], agents[3]]:
         sim.schedule(0.0, "PICK_PIECE", a, data="Movie_Stream")
 
-    for a in [agents[1], agents[2], agents[5]]:
-        sim.schedule(0.0, "PICK_PIECE", a, data="OS_ISO")
-
-    # Schedule Dynamic Appends and Stream Closures
-    sim.schedule(4.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
-    sim.schedule(8.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
+    # Dynamic Appends
+    sim.schedule(5.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
     sim.schedule(10.0, "FINALIZE_STREAM", agents[0], data="Movie_Stream")
 
-    sim.schedule(6.0, "APPEND_PIECES", agents[4], data=("OS_ISO", 6))
-    sim.schedule(12.0, "FINALIZE_STREAM", agents[4], data="OS_ISO")
+    print("=" * 80)
+    print("SPATIAL ROBOT RADIO SIMULATION TRACE")
+    print("=" * 80)
 
-    print("=" * 80)
-    print("MUTABLE CONCURRENT TORRENT TRACE (CASCADING FIXED)")
-    print("=" * 80)
+    # Print initial distance and pairwise channel capacities
+    for i in range(len(agents) - 1):
+        u, v = agents[i], agents[i+1]
+        dist, cap = sim.compute_link_capacity(u, v)
+        print(f"Link Agent {u.agent_id} <-> Agent {v.agent_id}: Dist = {dist:4.1f}m | Max Link Rate = {cap:5.2f} Mbps")
+    print("-" * 80)
 
     sim.run()
 
     print("\n" + "=" * 80)
-    print(f"{'Agent ID':<10} | {'Swarm ID':<15} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<15}")
+    print(f"{'Agent ID':<10} | {'Position (x,y)':<18} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<18}")
     print("-" * 80)
 
     for agent in agents:
-        for t_id in agent.completed_pieces:
-            if agent.start_time.get(t_id) is not None and agent.finish_time.get(t_id) is not None:
-                t, s, r = agent.get_metrics(sim, t_id)
-                print(f"Agent {agent.agent_id:<4} | {t_id:<15} | {t:6.2f} Mbps       | {s:6.4f}             | {r:6.4f}")
+        if agent.start_time.get("Movie_Stream") is not None and agent.finish_time.get("Movie_Stream") is not None:
+            t, s, r = agent.get_metrics(sim, "Movie_Stream")
+            pos_str = f"({agent.position[0]:.1f}, {agent.position[1]:.1f})"
+            print(f"Agent {agent.agent_id:<4} | {pos_str:<18} | {t:6.2f} Mbps       | {s:6.4f}     |   {r:6.4f}")
