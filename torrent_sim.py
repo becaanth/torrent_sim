@@ -2,6 +2,7 @@ import heapq
 import random
 import math
 from collections import Counter
+import json
 
 import pdb
 
@@ -64,9 +65,41 @@ class TorrentSim:
         self.d0 = d0
         self.gamma = gamma
 
+        # replay log
+        self.log = []
+
     # world-level setup
     def add_swarm(self, swarm):
         self.swarms[swarm.torrent_id] = swarm
+
+    def log_event(self, event_type, **fields):
+        self.log.append({"t": self.time, "type":event_type, **fields})
+
+    def build_header(self):
+        """Snapshot everything the replay/render script needs that never
+        changes once the run starts: swarm geometry, the agent roster,
+        and each agent's pre-run piece ownership (the free root piece,
+        plus whatever a seeder starts with). Call this after setup
+        (join_swarm/assign_cascade_chain) but before sim.run(), so the
+        remaining state changes are captured incrementally by the log."""
+        swarms = {
+            tid: {"direction": list(s.direction), "horizon_D": s.max_pieces}
+            for tid, s in self.swarms.items()
+        }
+        agents = []
+        initial_pieces = {}
+        for a in self.agents:
+            agents.append({
+                "id": a.agent_id,
+                "seeded_torrents": sorted(a.seeded_torrents),
+                "target_torrent_id": a.target_torrent_id,
+                "strategies": {tid: info["strategy"] for tid, info in a.strategies.items()},
+                "start_position": list(a.position),
+            })
+            initial_pieces[a.agent_id] = {
+                tid: sorted(pieces) for tid, pieces in a.completed_pieces.items()
+            }
+        return {"swarms": swarms, "agents": agents, "initial_pieces": initial_pieces}
 
     def compute_link_capacity(self, agent_a, agent_b):
         """radio capacity as a function of distance"""
@@ -138,6 +171,10 @@ class TorrentSim:
         uploader.active_uploads.add(transfer)
         self.active_transfers.add(transfer)
 
+        self.log_event("TRANSFER_START", transfer_id=transfer.transfer_id,
+                        torrent_id=torrent_id, piece_id=piece_id,
+                        downloader_id=downloader.agent_id, uploader_id=uploader.agent_id)
+
         self.recalculate_bandwidth()
 
     def finish_transfer(self, transfer):
@@ -148,14 +185,20 @@ class TorrentSim:
         self.active_transfers.remove(transfer)
         downloader.active_downloads.remove(transfer)
         transfer.uploader.active_uploads.remove(transfer)
+        self.log_event("TRANSFER_END", transfer_id=transfer.transfer_id)
 
         downloader.downloading_pieces[t_id].remove(transfer.piece_id)
         downloader.completed_pieces[t_id].add(transfer.piece_id)
+        self.log_event("PIECE_OWNED", agent_id=downloader.agent_id,
+                        torrent_id=t_id, piece_id=transfer.piece_id)
 
         # phyiscally move the agent to the frontier
         if downloader.target_torrent_id == t_id:
             frontier = downloader.contiguous_length(t_id) - 1 # furthest held index
             downloader.position = swarm.piece_position(frontier)
+            self.log_event("POSITION", agent_id=downloader.agent_id,
+                x=downloader.position[0], y=downloader.position[1])
+
 
         # record metrics
         downloader.record_useful_chunks(self,t_id)
@@ -177,8 +220,16 @@ class TorrentSim:
         new_pieces = set(range(new_start, swarm.published_pieces))
 
         publisher_agent.completed_pieces[torrent_id].update(new_pieces)
+        for p in sorted(new_pieces):
+            self.log_event("PIECE_OWNED", agent_id=publisher_agent.agent_id,
+                torrent_id=torrent_id, piece_id=p)
+
+
         # advance seeder to its newest map
         publisher_agent.position = swarm.piece_position(swarm.published_pieces - 1)
+        self.log_event("POSITION", agent_id=publisher_agent.agent_id,
+                        x=publisher_agent.position[0], y=publisher_agent.position[1])
+        self.log_event("APPEND", torrent_id=torrent_id, horizon=swarm.published_pieces)
 
         print(f"[Time {self.time:6.2f}s] APPEND: Swarm '{torrent_id}' +{count} pieces added. "
               f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
@@ -210,6 +261,7 @@ class TorrentSim:
         """Mark the stream as complete"""
         swarm = self.swarms[torrent_id]
         swarm.is_finalized = True
+        self.log_event("FINALIZE", torrent_id=torrent_id)
         print(f"[Time {self.time:6.2f}s] FINALIZE: Swarm '{torrent_id}': Closed at {swarm.published_pieces} total pieces.")
 
         # Trigger idle leechers to evaluate total completion
@@ -289,6 +341,9 @@ class Agent:
 
         # repeat we are executing
         self.target_torrent_id = None
+
+        # which swarms this agent seeds
+        self.seeded_torrents = set()
 
         # continuous time tracking sets
         self.active_uploads = set()
@@ -551,7 +606,7 @@ if __name__=="__main__":
 
     sim = TorrentSim()
 
-    HORIZON_D = 8          # mapping horizon: pieces per direction
+    HORIZON_D = 50          # mapping horizon: pieces per direction
     TICK_INTERVAL = 2.0    # seconds between seeder publish ticks
 
     # --- Build one swarm per cardinal direction ---
@@ -600,12 +655,12 @@ if __name__=="__main__":
     # (direction, strategy) pairs — feel free to vary these to compare
     # piece-picking strategies head-to-head on the same map.
     peer_plan = [
-        ("N", "cascading"),
-        ("N", "cascading"),
-        ("E", "cascading"),
-        ("S", "cascading"),
-        ("S", "cascading"),
-        ("W", "cascading"),
+        ("N", "rarest_random"),
+        ("N", "rarest_random"),
+        ("E", "rarest_random"),
+        ("S", "rarest_random"),
+        ("S", "rarest_random"),
+        ("W", "rarest_random"),
     ]
 
     peers = []
@@ -628,6 +683,8 @@ if __name__=="__main__":
     # runs -- a single random shuffle per swarm, never touched again.
     for name in CARDINAL_DIRECTIONS:
         sim.assign_cascade_chain(name, seeders[name])
+
+    log_header = sim.build_header()
 
     # Kick off piece-picking for every agent across every swarm it joined.
     for agent in all_agents:
@@ -663,3 +720,9 @@ if __name__=="__main__":
             strategy = agent.strategies[t_id]["strategy"]
             print(f"Agent {agent.agent_id:<4} | {t_id:<6} | {role:<8} | {strategy:<15} | "
                   f"{t:6.2f} Mbps  | {s:6.4f}       | {r:6.4f}")
+
+    # Write the replay log for the separate render_sim.py script.
+    log_path = "sim_log.json"
+    with open(log_path, "w") as f:
+        json.dump({"header": log_header, "events": sim.log}, f)
+    print(f"\nReplay log written to {log_path} ({len(sim.log)} events).")
