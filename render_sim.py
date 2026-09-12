@@ -26,6 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from matplotlib.lines import Line2D
 
 STRATEGY_COLORS = {
     "rarest_random": "#1f77b4",
@@ -35,6 +36,14 @@ STRATEGY_COLORS = {
     "segment_random": "#ff7f0e",
 }
 SEED_COLOR = "#000000"
+
+
+def build_swarm_colors(swarms):
+    """Assign each swarm/torrent a distinct color from a qualitative
+    colormap, built dynamically from the header rather than hardcoded so
+    this doesn't break if swarm names/count change between scenarios."""
+    cmap = plt.get_cmap("tab10")
+    return {tid: cmap(i % 10) for i, tid in enumerate(sorted(swarms))}
 
 
 def load_log(path):
@@ -105,6 +114,22 @@ def render(log_path, out_path, n_frames=150, fps=15):
 
     frame_times = build_frame_times(events, n_frames)
     state = ReplayState(header)
+    swarm_colors = build_swarm_colors(swarms)
+
+    # Legend handles are static (colors don't change frame to frame), so
+    # build them once rather than reconstructing on every draw_frame call.
+    swarm_legend_handles = [
+        Line2D([0], [0], color=color, lw=2, label=f"Swarm {tid}")
+        for tid, color in swarm_colors.items()
+    ]
+    role_legend_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=color,
+               markeredgecolor="black", markersize=8, label=strat)
+        for strat, color in STRATEGY_COLORS.items()
+    ] + [
+        Line2D([0], [0], marker="s", color="w", markerfacecolor=SEED_COLOR,
+               markeredgecolor="black", markersize=8, label="seed")
+    ]
 
     fig = plt.figure(figsize=(13, 7))
     grid = fig.add_gridspec(2, 3, width_ratios=[2, 1, 1])
@@ -136,22 +161,32 @@ def render(log_path, out_path, n_frames=150, fps=15):
         for tid, info in swarms.items():
             dx, dy = info["direction"]
             horizon = state.horizons[tid]
-            ax_world.plot([0, dx * horizon], [0, dy * horizon], "--", color="lightgray", zorder=0)
             style = "solid" if tid in state.finalized else "dotted"
             ax_world.plot([0, dx * horizon], [0, dy * horizon], linestyle=style,
-                          color="gray", linewidth=0.5, zorder=0)
+                          color=swarm_colors[tid], linewidth=1.5, alpha=0.5, zorder=0)
 
-        # active leech links: uploader -> downloader
+        # active leech links: uploader -> downloader, colored by which
+        # swarm's data is actually being transferred.
         for tid, downloader_id, uploader_id in state.active_transfers.values():
             ux, uy = state.positions[uploader_id]
             dx_, dy_ = state.positions[downloader_id]
             ax_world.annotate("", xy=(dx_, dy_), xytext=(ux, uy),
-                               arrowprops=dict(arrowstyle="->", color="orange", alpha=0.6, lw=1.2))
+                               arrowprops=dict(arrowstyle="->", color=swarm_colors[tid], alpha=0.85, lw=1.4))
 
         for agent_id, pos in state.positions.items():
             color, marker = agent_style(agents_by_id[agent_id])
             ax_world.scatter(*pos, color=color, marker=marker, s=80, zorder=3, edgecolors="black", linewidths=0.5)
             ax_world.annotate(str(agent_id), pos, fontsize=7, xytext=(3, 3), textcoords="offset points")
+
+        # Two legends: which swarm a path/arrow belongs to, and what an
+        # agent marker's color/shape means. ax_world.clear() above wipes
+        # any previous legend, so these get redrawn every frame from the
+        # static handles built once outside the loop.
+        # swarm_legend = ax_world.legend(handles=swarm_legend_handles, loc="upper left",
+        #                                 fontsize=6, title="Swarm (path/arrow)", title_fontsize=7)
+        # ax_world.add_artist(swarm_legend)
+        # ax_world.legend(handles=role_legend_handles, loc="lower left",
+        #                  fontsize=6, title="Agent role", title_fontsize=7)
 
         # --- bitmap panels: one per swarm ---
         for tid, ax in bitmap_axes.items():

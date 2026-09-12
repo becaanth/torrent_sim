@@ -78,10 +78,7 @@ class TorrentSim:
     def build_header(self):
         """Snapshot everything the replay/render script needs that never
         changes once the run starts: swarm geometry, the agent roster,
-        and each agent's pre-run piece ownership (the free root piece,
-        plus whatever a seeder starts with). Call this after setup
-        (join_swarm/assign_cascade_chain) but before sim.run(), so the
-        remaining state changes are captured incrementally by the log."""
+        and each agent's pre-run piece ownership"""
         swarms = {
             tid: {"direction": list(s.direction), "horizon_D": s.max_pieces}
             for tid, s in self.swarms.items()
@@ -191,15 +188,7 @@ class TorrentSim:
         downloader.completed_pieces[t_id].add(transfer.piece_id)
         self.log_event("PIECE_OWNED", agent_id=downloader.agent_id,
                         torrent_id=t_id, piece_id=transfer.piece_id)
-
-        # phyiscally move the agent to the frontier
-        if downloader.target_torrent_id == t_id:
-            frontier = downloader.contiguous_length(t_id) - 1 # furthest held index
-            downloader.position = swarm.piece_position(frontier)
-            self.log_event("POSITION", agent_id=downloader.agent_id,
-                x=downloader.position[0], y=downloader.position[1])
-
-
+        
         # record metrics
         downloader.record_useful_chunks(self,t_id)
         self.recalculate_bandwidth()
@@ -244,6 +233,10 @@ class TorrentSim:
         self.schedule(interval, "SEEDER_TICK", seeder_agent,
                       data=(torrent_id, interval, pieces_per_tick))
 
+    def start_walker(self, agent, torrent_id, interval):
+        """Leechers walking clock (enabling repeats)"""
+        self.schedule(interval, "MOVE_TICK", agent, data=(torrent_id, interval))
+
     def assign_cascade_chain(self, torrent_id, seeder_agent, rng=random):
         """IMO faithful cascading implementation - random connectivity chains at session start"""
         swarm = self.swarms[torrent_id]
@@ -269,8 +262,13 @@ class TorrentSim:
             if not any(t.torrent_id == torrent_id for t in agent.active_downloads):
                 self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
         
-    def run(self):
+    def run(self, max_time=None):
         while self.event_queue:
+            if max_time is not None and self.event_queue[0][0] > max_time:
+                print(f"[SAFETY STOP] max_time={max_time}s reached with "
+                    f"{len(self.event_queue)} events still queued -- halting early.")
+                break
+
             self.time, _, event_type, agent, data = heapq.heappop(self.event_queue)
 
             if event_type == "PICK_PIECE":
@@ -280,6 +278,13 @@ class TorrentSim:
             elif event_type == "APPEND_PIECES":
                 torrent_id, count = data
                 self.append_pieces(torrent_id, count, agent)
+
+            elif event_type == "MOVE_TICK":
+                torrent_id, interval = data
+                agent.try_walk_step(self, torrent_id)
+                swarm = self.swarms[torrent_id]
+                if not (swarm.is_finalized and agent.walk_step >= swarm.published_pieces - 1):
+                    self.schedule(interval, "MOVE_TICK", agent, data=(torrent_id, interval))
 
             elif event_type == "SEEDER_TICK":
                 torrent_id, interval, pieces_per_tick = data
@@ -341,6 +346,7 @@ class Agent:
 
         # repeat we are executing
         self.target_torrent_id = None
+        self.walk_step = 0
 
         # which swarms this agent seeds
         self.seeded_torrents = set()
@@ -408,6 +414,16 @@ class Agent:
         dx = self.position[0] - other.position[0]
         dy = self.position[1] - other.position[1]
         return math.sqrt(dx * dx + dy * dy)
+
+    def try_walk_step(self, sim, torrent_id):
+        """try to advance on MOVE_TICK"""
+        swarm = sim.swarms[torrent_id]
+        next_step = self.walk_step + 1
+        if next_step in self.completed_pieces[torrent_id]:
+            self.walk_step = next_step
+            self.position = swarm.piece_position(self.walk_step)
+            sim.log_event("POSITION", agent_id=self.agent_id,
+                x=self.position[0], y=self.position[1])
 
     def record_useful_chunks(self, sim, torrent_id):
         """U(x) per Eq. 10 in Fan et al."""
@@ -606,8 +622,10 @@ if __name__=="__main__":
 
     sim = TorrentSim()
 
-    HORIZON_D = 50          # mapping horizon: pieces per direction
-    TICK_INTERVAL = 2.0    # seconds between seeder publish ticks
+    HORIZON_D = 50
+    TICK_INTERVAL = 2.0
+    MOVE_INTERVAL = 1.5   # seconds per physical unit-step, same for every agent
+    MAX_SIM_TIME = 5000.0  # safety backstop -- see TorrentSim.run() docstring
 
     # --- Build one swarm per cardinal direction ---
     swarms = {}
@@ -675,6 +693,7 @@ if __name__=="__main__":
                 strategy=strategy,
                 is_target=(name == target_dir),
             )
+        sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL)
         peers.append(peer)
 
     sim.agents = all_agents
@@ -702,7 +721,7 @@ if __name__=="__main__":
               f"| target={agent.target_torrent_id}")
     print("-" * 90)
 
-    sim.run()
+    sim.run(max_time=MAX_SIM_TIME)
 
     print("\n" + "=" * 100)
     print("PER-SESSION TRS METRICS")
