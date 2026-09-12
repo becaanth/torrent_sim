@@ -5,14 +5,36 @@ from collections import Counter
 
 import pdb
 
+CARDINAL_DIRECTIONS = {
+    "N": (0.0, 1.0),
+    "E": (1.0, 0.0),
+    "S": (0.0, -1.0),
+    "W": (-1.0, 0.0),
+}
+
+def random_radio_profile(rng=random, c_max_range=(6.0, 14.0),
+                          d0_range=(5.0, 15.0), gamma_range=(1.5, 3.0)):
+    """sample a random radio"""
+    return {
+        "radio_c_max": rng.uniform(*c_max_range),
+        "radio_d0": rng.uniform(*d0_range),
+        "radio_gamma": rng.uniform(*gamma_range),
+    }
+
 class Swarm:
     """Represents a single torrent session"""
-    def __init__(self, torrent_id, initial_pieces=10, piece_size_mb=1):
+    def __init__(self, torrent_id, direction, initial_pieces=1, piece_size_mb=1, max_pieces=None):
         self.torrent_id = torrent_id
+        self.direction = direction
         self.published_pieces = initial_pieces
         self.piece_size_mb = piece_size_mb
+        self.max_pieces = max_pieces
         self.is_finalized = False # flag for closing the stream
         self.participants = set()
+
+    def piece_position(self, piece_id):
+        """give a spatial position for the piece"""
+        return (self.direction[0] * piece_id, self.direction[1] * piece_id)
 
 class Transfer:
     def __init__(self, transfer_id, torrent_id, downloader, uploader, piece_id, total_size_mb):
@@ -37,7 +59,7 @@ class TorrentSim:
         self.active_transfers = set()
         self.agents = []
 
-        # spatial channel params
+        # spatial channel params (nominally can set heterogeneity per-agent)
         self.c_max = c_max # max radio throughput
         self.d0 = d0
         self.gamma = gamma
@@ -52,8 +74,12 @@ class TorrentSim:
         dy = agent_a.position[1] - agent_b.position[1]
         dist = math.sqrt(dx * dx + dy * dy)
 
-        # path-loss attenuation
-        capacity = self.c_max / (1.0 + (dist/self.d0)**self.gamma)
+        # path-loss attenuation (w/ heterogenous radios)
+        c_max = min(agent_a.radio_c_max, agent_b.radio_c_max)
+        d0 = (agent_a.radio_d0 + agent_b.radio_d0) / 2.0
+        gamma = (agent_a.radio_gamma + agent_b.radio_gamma) / 2.0
+
+        capacity = c_max / (1.0 + (dist/d0)**gamma)
         return dist, capacity
 
     def schedule(self, delay, event_type, agent, data=None):
@@ -73,7 +99,7 @@ class TorrentSim:
                 t.remaining_mb = max(0.0, t.remaining_mb - mb_transferred)
             t.last_update_time = self.time
 
-    # per-channel chunk capacity following Fan et al/
+    # per-channel chunk capacity following Fan et al.
     def recalculate_bandwidth(self):
         """
         Dynamically divide uploader/downloader capcaity among active streams per Fan et al. per-chunk capacity formulation
@@ -116,6 +142,7 @@ class TorrentSim:
 
     def finish_transfer(self, transfer):
         t_id = transfer.torrent_id
+        swarm = self.swarms[t_id]
         downloader = transfer.downloader
 
         self.active_transfers.remove(transfer)
@@ -125,13 +152,20 @@ class TorrentSim:
         downloader.downloading_pieces[t_id].remove(transfer.piece_id)
         downloader.completed_pieces[t_id].add(transfer.piece_id)
 
+        # phyiscally move the agent to the frontier
+        if downloader.target_torrent_id == t_id:
+            frontier = downloader.contiguous_length(t_id) - 1 # furthest held index
+            downloader.position = swarm.piece_position(frontier)
+
         # record metrics
         downloader.record_useful_chunks(self,t_id)
         self.recalculate_bandwidth()
 
         self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
         # wake up any idle neighbours in this swarm (Fixes cascading pipeline stall)
-        for neighbours in downloader.neighbours[t_id]:
+        for neighbours in swarm.participants:
+            if peer is downloader:
+                continue
             if not any(t.torrent_id == t_id for t in neighbours.active_downloads):
                 self.schedule(0.0, "PICK_PIECE", neighbours, data=t_id)
 
@@ -143,13 +177,34 @@ class TorrentSim:
         new_pieces = set(range(new_start, swarm.published_pieces))
 
         publisher_agent.completed_pieces[torrent_id].update(new_pieces)
+        # advance seeder to its newest map
+        publisher_agent.position = swarm.piece_position(swarm.published_pieces - 1)
+
         print(f"[Time {self.time:6.2f}s] APPEND: Swarm '{torrent_id}' +{count} pieces added. "
               f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
-
+        
         # wake up idle leechers
         for agent in swarm.participants:
             if agent != publisher_agent: 
                 self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
+
+    def start_seeder(self, seeder_agent, torrent_id, interval, pieces_per_tick=1):
+        """recurring publisher timer for a seeder"""
+        self.schedule(interval, "SEEDER_TICK", seeder_agent,
+                      data=(torrent_id, interval, pieces_per_tick))
+
+    def assign_cascade_chain(self, torrent_id, seeder_agent, rng=random):
+        """IMO faithful cascading implementation - random connectivity chains at session start"""
+        swarm = self.swarms[torrent_id]
+        cascading_peers = [
+            p for p in swarm.participants
+            if p is not seeder and p.strategies[torrent_id]["strategy"] == "cascading"
+        ]
+        rng.shuffle(cascading_peers)
+
+        chain = [seeder_agent] + cascading_peers
+        for upstream, downstream in zip(chain, chain[1:]):
+            downstream.upstream_peers[torrent_id] = upstream
 
     def finalize_stream(self, torrent_id):
         """Mark the stream as complete"""
@@ -173,6 +228,26 @@ class TorrentSim:
             elif event_type == "APPEND_PIECES":
                 torrent_id, count = data
                 self.append_pieces(torrent_id, count, agent)
+
+            elif event_type == "SEEDER_TICK":
+                torrent_id, interval, pieces_per_tick = data
+                swarm = self.swarms[torrent_id]
+                if swarm.is_finalized:
+                    continue
+
+                pieces_to_add = pieces_per_tick
+                if swarm.max_pieces is not None:
+                    remaining_horizon = swarm.max_pieces - swarm.published_pieces
+                    pieces_to_add = max(0, min(pieces_per_tick, remaining_horizon))
+
+                if pieces_to_add > 0:
+                    self.append_pieces(torrent_id, pieces_to_add, agent)
+
+                if swarm.max_pieces is not None and swarm.published_pieces >= swarm.max_pieces:
+                    self.finalize_stream(torrent_id)
+                else: # keep ticking
+                    self.schedule(interval, "SEEDER_TICK", agent,
+                                  data=(torrent_id, interval, pieces_per_tick))
 
             elif event_type == "FINALIZE_STREAM":
                 torrent_id = data
@@ -199,11 +274,21 @@ class TorrentSim:
 
 class Agent:
     """all agents in a swarm"""
-    def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10):
+    def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10,
+            radio_c_max=10.0, radio_d0=10.0, radio_gamma=2.0            
+        ):
         self.agent_id = agent_id
         self.position = position # (x,y)
         self.download_speed = download_speed_mbps
         self.upload_speed = upload_speed_mbps
+
+        # per-agent radio hardware
+        self.radio_c_max = radio_c_max
+        self.radio_d0 = radio_d0
+        self.radio_gamma = radio_gamma
+
+        # repeat we are executing
+        self.target_torrent_id = None
 
         # continuous time tracking sets
         self.active_uploads = set()
@@ -222,11 +307,15 @@ class Agent:
         self.u_x_history = {} # history of useful chunks
         self.r_bar_snapshots = {} # history of robustness
 
-    def join_swarm(self, swarm, strategy="rarest_random", hybrid_s=0.5, segment_k=5, upstream_peer=None, is_seeder=False):
+    def join_swarm(self, swarm, strategy="rarest_random", hybrid_s=0.5, segment_k=5, upstream_peer=None, is_seeder=False, is_target=False):
         t_id = swarm.torrent_id
         swarm.participants.add(self)
 
-        self.completed_pieces[t_id] = set(range(swarm.published_pieces)) if is_seeder else set()
+        if is_seeder:
+            self.completed_pieces[t_id] = set(range(swarm.published_pieces))
+        else:
+            self.completed_pieces[t_id] = {0} # hold root node for free
+
         self.downloading_pieces[t_id] = set()
         self.neighbours[t_id] = []
         self.strategies[t_id] = {
@@ -235,6 +324,10 @@ class Agent:
             "segment_k": segment_k
         }
         self.upstream_peers[t_id] = upstream_peer
+
+        # record who we're tracking
+        if is_target:
+            self.target_torrent_id = t_id
 
         self.start_time[t_id] = None
         self.finish_time[t_id] = None
@@ -247,13 +340,25 @@ class Agent:
         if self not in other_agent.neighbours[torrent_id]:
             other_agent.neighbours[torrent_id].append(self)
 
+    def contiguous_length(self, torrent_id):
+        """how many contiguous maps do we hold"""
+        completed = self.completed_pieces[torrent_id]
+        length = 0
+        while length in completed:
+            length += 1
+        return length
+
+    def distance_to(self, other):
+        """tie-breaker for cascading"""
+        dx = self.position[0] - other.position[0]
+        dy = self.position[1] - other.position[1]
+        return math.sqrt(dx * dx + dy * dy)
+
     def record_useful_chunks(self, sim, torrent_id):
         """U(x) per Eq. 10 in Fan et al."""
         completed = self.completed_pieces[torrent_id]
         x = len(completed)
-        contiguous_len = 0
-        while contiguous_len in completed:
-            contiguous_len += 1
+        contiguous_len = self.contiguous_length(torrent_id)
 
         u_x = contiguous_len / x if x > 0 else 0.0
         self.u_x_history[torrent_id].append(u_x)
@@ -274,7 +379,10 @@ class Agent:
                 if upstream and p in upstream.completed_pieces[torrent_id]:
                     r_i_sum += 1
             else:
-                r_i_sum += sum(1 for n in self.neighbours[torrent_id] if p in n.completed_pieces[torrent_id])
+                r_i_sum += sum(
+                    1 for peer in swarm.participants 
+                    if p in peer.completed_pieces[torrent_id]
+                )
         return r_i_sum / swarm.published_pieces
 
     def get_metrics(self, sim, torrent_id, p_error=0.5):
@@ -316,7 +424,7 @@ class Agent:
         missing = set(range(swarm.published_pieces)) - self.completed_pieces[torrent_id] - self.downloading_pieces[torrent_id]
         if not missing:
             # Handle stream completion if finalized while idle
-            if len(self.completed_pieces[torrent_id]) == swarm.published_pieces and swarm.is_finalized and self.finish_time is None:
+            if len(self.completed_pieces[torrent_id]) == swarm.published_pieces and swarm.is_finalized:
                 if self.finish_time[torrent_id] is None:
                     self.finish_time[torrent_id] = sim.time
                     print(f"[Time {sim.time:6.2f}s] Agent {self.agent_id:2d}"
@@ -330,13 +438,15 @@ class Agent:
 
         chosen_piece = None
         target_agent = None
-        neighbours = self.neighbours[torrent_id]
+
+        # bitmap discovery is global (like zenoh gossip), only transfer will throttle
+        candidates = [p for p in swarm.participants if p is not self]
 
         # RAREST-RANDOM
         if strategy == "rarest_random":
             available_pieces = Counter()
             peer_map = {} # piece_id -> list of peers who have it
-            for n in neighbours:
+            for n in candidates:
                 for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
@@ -352,7 +462,7 @@ class Agent:
         elif strategy == "sequential":
             available_pieces = set()
             peer_map = {}
-            for n in neighbours:
+            for n in candidates:
                 for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces.add(p)
@@ -366,11 +476,6 @@ class Agent:
         elif strategy == "cascading":
             # check if current bound target peer still has missing pieces to offer
             upstream = self.upstream_peers.get(torrent_id)
-            # default to first connected neighbour if None
-            if upstream is None and len(neighbours) > 0:
-                upstream = neighbours[0]
-                self.upstream_peers[torrent_id] = upstream
-
             if upstream is not None:
                 available = upstream.completed_pieces[torrent_id] & missing
                 if available:
@@ -381,7 +486,7 @@ class Agent:
         elif strategy == 'hybrid':
             available_pieces = Counter()
             peer_map = {}
-            for n in neighbours:
+            for n in candidates:
                 for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
@@ -401,7 +506,7 @@ class Agent:
         elif strategy == 'segment_random':
             available_pieces = Counter()
             peer_map = {}
-            for n in neighbours:
+            for n in candidates:
                 for p in n.completed_pieces[torrent_id]:
                     if p in missing:
                         available_pieces[p] += 1
@@ -433,58 +538,128 @@ class Agent:
             )
 
 if __name__=="__main__":
-    sim = TorrentSim(c_max=10.0, d0=10.0, gamma=2.0)
+    # NEW DEMO: multi-directional mapping scenario.
+    #
+    # Four seeders map outward from a shared root (0,0), one per cardinal
+    # direction, each its own swarm/torrent. Several peer robots each
+    # target one direction (their physical path) while still fully
+    # participating (downloading + relaying) in every other swarm. Radio
+    # hardware is heterogeneous per-agent via random_radio_profile(), and
+    # each swarm has a fixed mapping horizon D so the run terminates
+    # predictably.
+    random.seed(42)  # reproducible heterogeneous radio spawns
 
-    # Instantiate Swarm
-    swarm_vod = Swarm("Movie_Stream", initial_pieces=6, piece_size_mb=1)
-    sim.add_swarm(swarm_vod)
+    sim = TorrentSim()
 
-    # Create 4 Spatial Robot Agents positioned along the X-axis
-    agents = [
-        Agent(agent_id=0, position=(0.0, 0.0)),   # Seeder at origin
-        Agent(agent_id=1, position=(5.0, 0.0)),   # 5m away
-        Agent(agent_id=2, position=(15.0, 0.0)),  # 15m away
-        Agent(agent_id=3, position=(30.0, 0.0))   # 30m away
+    HORIZON_D = 8          # mapping horizon: pieces per direction
+    TICK_INTERVAL = 2.0    # seconds between seeder publish ticks
+
+    # --- Build one swarm per cardinal direction ---
+    swarms = {}
+    for name, direction in CARDINAL_DIRECTIONS.items():
+        swarms[name] = Swarm(
+            torrent_id=name,
+            direction=direction,
+            initial_pieces=1,       # just the shared root to start
+            piece_size_mb=1,
+            max_pieces=HORIZON_D,
+        )
+        sim.add_swarm(swarms[name])
+
+    all_agents = []
+    next_agent_id = 0
+    use_random_radio = False
+
+    def spawn_agent(use_random_radio=True, **kwargs):
+        """Helper: assign the next agent_id and either a randomized radio profile
+        or default Agent radio parameters unless overridden."""
+        global next_agent_id
+        radio_overrides = kwargs.pop("radio_overrides", {})
+        
+        profile = {}
+        if use_random_radio:
+            profile = random_radio_profile()
+            
+        profile.update(radio_overrides)
+        
+        agent = Agent(agent_id=next_agent_id, **profile, **kwargs)
+        next_agent_id += 1
+        all_agents.append(agent)
+        return agent
+
+    # --- One seeder per direction, all starting at the shared root ---
+    seeders = {}
+    for name in CARDINAL_DIRECTIONS:
+        seeder = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
+        seeder.join_swarm(swarms[name], strategy="rarest_random",
+                           is_seeder=True, is_target=True)
+        seeders[name] = seeder
+        sim.start_seeder(seeder, name, interval=TICK_INTERVAL)
+
+    # --- N peers per target path, each fully participating in every swarm ---
+    # (direction, strategy) pairs — feel free to vary these to compare
+    # piece-picking strategies head-to-head on the same map.
+    peer_plan = [
+        ("N", "cascading"),
+        ("N", "cascading"),
+        ("E", "cascading"),
+        ("S", "cascading"),
+        ("S", "cascading"),
+        ("W", "cascading"),
     ]
-    sim.agents = agents
 
-    # Join Swarm in Cascading chain: 0 -> 1 -> 2 -> 3
-    agents[0].join_swarm(swarm_vod, is_seeder=True)
-    agents[1].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[0])
-    agents[2].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[1])
-    agents[3].join_swarm(swarm_vod, strategy="rarest_random", upstream_peer=agents[2])
+    peers = []
+    for target_dir, strategy in peer_plan:
+        peer = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
+        for name in CARDINAL_DIRECTIONS:
+            # Every peer joins every swarm (full participation), but only
+            # its target direction is marked is_target=True so that
+            # progress there is what actually moves it through space.
+            peer.join_swarm(
+                swarms[name],
+                strategy=strategy,
+                is_target=(name == target_dir),
+            )
+        peers.append(peer)
 
-    agents[0].connect(agents[1], "Movie_Stream")
-    agents[1].connect(agents[2], "Movie_Stream")
-    agents[2].connect(agents[3], "Movie_Stream")
+    sim.agents = all_agents
 
-    # Schedule initial pick events
-    for a in [agents[1], agents[2], agents[3]]:
-        sim.schedule(0.0, "PICK_PIECE", a, data="Movie_Stream")
+    # NEW: lock in each swarm's cascade chain now, once, before anything
+    # runs -- a single random shuffle per swarm, never touched again.
+    for name in CARDINAL_DIRECTIONS:
+        sim.assign_cascade_chain(name, seeders[name])
 
-    # Dynamic Appends
-    sim.schedule(5.0, "APPEND_PIECES", agents[0], data=("Movie_Stream", 4))
-    sim.schedule(10.0, "FINALIZE_STREAM", agents[0], data="Movie_Stream")
+    # Kick off piece-picking for every agent across every swarm it joined.
+    for agent in all_agents:
+        for name in CARDINAL_DIRECTIONS:
+            if name in agent.strategies:
+                sim.schedule(0.0, "PICK_PIECE", agent, data=name)
 
-    print("=" * 80)
-    print("SPATIAL ROBOT RADIO SIMULATION TRACE")
-    print("=" * 80)
-
-    # Print initial distance and pairwise channel capacities
-    for i in range(len(agents) - 1):
-        u, v = agents[i], agents[i+1]
-        dist, cap = sim.compute_link_capacity(u, v)
-        print(f"Link Agent {u.agent_id} <-> Agent {v.agent_id}: Dist = {dist:4.1f}m | Max Link Rate = {cap:5.2f} Mbps")
-    print("-" * 80)
+    print("=" * 90)
+    print("MULTI-DIRECTIONAL MAPPING SIMULATION")
+    print(f"Horizon D={HORIZON_D} pieces/direction, tick interval={TICK_INTERVAL}s")
+    print("=" * 90)
+    for agent in all_agents:
+        print(f"Agent {agent.agent_id:2d} | radio c_max={agent.radio_c_max:5.2f} "
+              f"d0={agent.radio_d0:5.2f} gamma={agent.radio_gamma:4.2f} "
+              f"| target={agent.target_torrent_id}")
+    print("-" * 90)
 
     sim.run()
 
-    print("\n" + "=" * 80)
-    print(f"{'Agent ID':<10} | {'Position (x,y)':<18} | {'Throughput (T)':<15} | {'Sequentiality (S)':<18} | {'Robustness (R)':<18}")
-    print("-" * 80)
-
-    for agent in agents:
-        if agent.start_time.get("Movie_Stream") is not None and agent.finish_time.get("Movie_Stream") is not None:
-            t, s, r = agent.get_metrics(sim, "Movie_Stream")
-            pos_str = f"({agent.position[0]:.1f}, {agent.position[1]:.1f})"
-            print(f"Agent {agent.agent_id:<4} | {pos_str:<18} | {t:6.2f} Mbps       | {s:6.4f}     |   {r:6.4f}")
+    print("\n" + "=" * 100)
+    print("PER-SESSION TRS METRICS")
+    print("Each agent gets one row per swarm it participated in (target path")
+    print("plus every swarm it relayed for), not just its own target.")
+    print("=" * 100)
+    print(f"{'Agent ID':<10} | {'Swarm':<6} | {'Role':<8} | {'Strategy':<15} | {'Throughput':<12} | {'Sequentiality':<14} | {'Robustness'}")
+    print("-" * 100)
+    for agent in all_agents:
+        for t_id in agent.strategies:
+            if agent.start_time.get(t_id) is None or agent.finish_time.get(t_id) is None:
+                continue  # this session never completed (or never started)
+            t, s, r = agent.get_metrics(sim, t_id)
+            role = "TARGET" if t_id == agent.target_torrent_id else "relay"
+            strategy = agent.strategies[t_id]["strategy"]
+            print(f"Agent {agent.agent_id:<4} | {t_id:<6} | {role:<8} | {strategy:<15} | "
+                  f"{t:6.2f} Mbps  | {s:6.4f}       | {r:6.4f}")
