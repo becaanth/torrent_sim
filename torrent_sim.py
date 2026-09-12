@@ -3,6 +3,7 @@ import random
 import math
 from collections import Counter
 import json
+import csv
 
 import pdb
 
@@ -374,6 +375,7 @@ class Agent:
 
         if is_seeder:
             self.completed_pieces[t_id] = set(range(swarm.published_pieces))
+            self.seeded_torrents.add(t_id)
         else:
             self.completed_pieces[t_id] = {0} # hold root node for free
 
@@ -619,6 +621,7 @@ if __name__=="__main__":
     # each swarm has a fixed mapping horizon D so the run terminates
     # predictably.
     random.seed(42)  # reproducible heterogeneous radio spawns
+    STRATEGY = "cascading"
 
     sim = TorrentSim()
 
@@ -673,12 +676,12 @@ if __name__=="__main__":
     # (direction, strategy) pairs — feel free to vary these to compare
     # piece-picking strategies head-to-head on the same map.
     peer_plan = [
-        ("N", "rarest_random"),
-        ("N", "rarest_random"),
-        ("E", "rarest_random"),
-        ("S", "rarest_random"),
-        ("S", "rarest_random"),
-        ("W", "rarest_random"),
+        ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("E", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("W", STRATEGY),
     ]
 
     peers = []
@@ -723,6 +726,46 @@ if __name__=="__main__":
 
     sim.run(max_time=MAX_SIM_TIME)
 
+    # Per-swarm achievable throughput ceiling, computed once per swarm:
+    swarm_t_max = {}
+    for t_id, swarm in sim.swarms.items():
+        peers_in_swarm = [p for p in swarm.participants if t_id not in p.seeded_torrents]
+        seed_agents = [p for p in swarm.participants if t_id in p.seeded_torrents]
+        n_peers = len(peers_in_swarm)
+        if n_peers == 0:
+            swarm_t_max[t_id] = None
+            continue
+        u_s = seed_agents[0].upload_speed if seed_agents else 0.0
+        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_peers
+        swarm_t_max[t_id] = (u_s + n_peers * u_p_avg) / n_peers
+
+    metrics_rows = []
+    for agent in all_agents:
+        for t_id in agent.strategies:
+            if agent.start_time.get(t_id) is None or agent.finish_time.get(t_id) is None:
+                continue  # this session never completed (or never started)
+
+            is_seed = t_id in agent.seeded_torrents
+            role = "SEED" if is_seed else ("TARGET" if t_id == agent.target_torrent_id else "relay")
+            t, s, r = (None, None, None) if is_seed else agent.get_metrics(sim, t_id)
+
+            metrics_rows.append({
+                "agent_id": agent.agent_id,
+                "torrent_id": t_id,
+                "target_torrent_id": agent.target_torrent_id,
+                "role": role,
+                "strategy": "(source)" if is_seed else agent.strategies[t_id]["strategy"],
+                "throughput_mbps": t,
+                "sequentiality": s,
+                "robustness": r,
+                "n_peers": None if is_seed else len(
+                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
+                "t_max_mbps": None if is_seed else swarm_t_max[t_id],
+                "start_time": agent.start_time[t_id],
+                "finish_time": agent.finish_time[t_id],
+            })
+
+
     print("\n" + "=" * 100)
     print("PER-SESSION TRS METRICS")
     print("Each agent gets one row per swarm it participated in (target path")
@@ -730,18 +773,29 @@ if __name__=="__main__":
     print("=" * 100)
     print(f"{'Agent ID':<10} | {'Swarm':<6} | {'Role':<8} | {'Strategy':<15} | {'Throughput':<12} | {'Sequentiality':<14} | {'Robustness'}")
     print("-" * 100)
-    for agent in all_agents:
-        for t_id in agent.strategies:
-            if agent.start_time.get(t_id) is None or agent.finish_time.get(t_id) is None:
-                continue  # this session never completed (or never started)
-            t, s, r = agent.get_metrics(sim, t_id)
-            role = "TARGET" if t_id == agent.target_torrent_id else "relay"
-            strategy = agent.strategies[t_id]["strategy"]
-            print(f"Agent {agent.agent_id:<4} | {t_id:<6} | {role:<8} | {strategy:<15} | "
-                  f"{t:6.2f} Mbps  | {s:6.4f}       | {r:6.4f}")
+    for row in metrics_rows:
+        if row["role"] == "SEED":
+            print(f"Agent {row['agent_id']:<4} | {row['torrent_id']:<6} | {'SEED':<8} | "
+                  f"{'(source)':<15} | {'n/a':<12} | {'n/a':<14} | n/a")
+        else:
+            print(f"Agent {row['agent_id']:<4} | {row['torrent_id']:<6} | {row['role']:<8} | {row['strategy']:<15} | "
+                  f"{row['throughput_mbps']:6.2f} Mbps  | {row['sequentiality']:6.4f}       | {row['robustness']:6.4f}")
 
-    # Write the replay log for the separate render_sim.py script.
-    log_path = "sim_log.json"
+    # Write the replay log for render_sim.py...
+    log_path = f"{STRATEGY}_log.json"
     with open(log_path, "w") as f:
         json.dump({"header": log_header, "events": sim.log}, f)
     print(f"\nReplay log written to {log_path} ({len(sim.log)} events).")
+
+    # ...and the per-session TRS table for a separate metrics/plotting
+    # script (ternary plot, scatter, etc. -- to be scoped next). Seed rows
+    # are included with blank T/S/R fields (not the string "n/a") so a
+    # CSV reader treats them as missing values rather than text.
+    metrics_path = f"{STRATEGY}.csv"
+    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy",
+                  "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps", "start_time", "finish_time"]
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+    print(f"Per-session TRS metrics written to {metrics_path} ({len(metrics_rows)} rows).")
