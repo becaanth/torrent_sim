@@ -216,13 +216,13 @@ class TorrentSim:
 
         self.active_transfers.discard(transfer)
         downloader.active_downloads.discard(transfer)
-        uploader.active_downloads.discard(transfer)
+        uploader.active_uploads.discard(transfer)
         downloader.downloading_pieces[t_id].discard(transfer.piece_id)
 
         self.log_event("TRANSFER_END", transfer_id=transfer.transfer_id, aborted=True, reason=reason)
 
         self.recalculate_bandwidth()
-        # give downloaded a chance to repick
+        # give downloader a chance to repick
         self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
 
     def all_work_done(self):
@@ -698,13 +698,13 @@ if __name__=="__main__":
 
     sim = TorrentSim()
 
-    HORIZON_D = 50
+    HORIZON_D = 500
     TICK_INTERVAL = 2.0
     MOVE_INTERVAL = 1.5   # seconds per physical unit-step, same for every agent
-    MAX_SIM_TIME = 5000.0  # safety backstop -- see TorrentSim.run() docstring
+    MAX_SIM_TIME = 100000.0  # safety backstop -- see TorrentSim.run() docstring
 
     P_BAD = 0.0                # probability a given peer is "bad" (Fan et al.'s p)
-    CHURN_MEAN_UP = 15.0       # mean seconds a bad peer stays available before dropping
+    CHURN_MEAN_UP = 15.0        # mean seconds a bad peer stays available before dropping
     CHURN_MEAN_DOWN = 5.0      # mean seconds a bad peer stays gone before rejoining
     sim.p_bad = P_BAD          # read by get_metrics() for the reported robustness score
 
@@ -733,6 +733,12 @@ if __name__=="__main__":
         profile = {}
         if use_random_radio:
             profile = random_radio_profile()
+        else:
+            profile =  {
+                "radio_c_max": 10.0,
+                "radio_d0": 10000.0,
+                "radio_gamma": 2.0,
+            }
             
         profile.update(radio_overrides)
         
@@ -756,9 +762,23 @@ if __name__=="__main__":
     peer_plan = [
         ("N", STRATEGY),
         ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
         ("E", STRATEGY),
         ("S", STRATEGY),
         ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
         ("W", STRATEGY),
     ]
 
