@@ -66,6 +66,9 @@ class TorrentSim:
         self.d0 = d0
         self.gamma = gamma
 
+        # p(bad peer) following Fan et al.
+        self.p_bad = 0.5
+
         # replay log
         self.log = []
 
@@ -93,6 +96,7 @@ class TorrentSim:
                 "target_torrent_id": a.target_torrent_id,
                 "strategies": {tid: info["strategy"] for tid, info in a.strategies.items()},
                 "start_position": list(a.position),
+                "is_bad": a.is_bad,
             })
             initial_pieces[a.agent_id] = {
                 tid: sorted(pieces) for tid, pieces in a.completed_pieces.items()
@@ -202,6 +206,42 @@ class TorrentSim:
             if not any(t.torrent_id == t_id for t in neighbours.active_downloads):
                 self.schedule(0.0, "PICK_PIECE", neighbours, data=t_id)
 
+    def cancel_transfer(self, transfer, reason="churn"):
+        """abort in-progress transfer (dont mark piece as completed)"""
+        if transfer not in self.active_transfers:
+            return
+        t_id = transfer.torrent_id
+        downloader = transfer.downloader
+        uploader = transfer.uploader
+
+        self.active_transfers.discard(transfer)
+        downloader.active_downloads.discard(transfer)
+        uploader.active_downloads.discard(transfer)
+        downloader.downloading_pieces[t_id].discard(transfer.piece_id)
+
+        self.log_event("TRANSFER_END", transfer_id=transfer.transfer_id, aborted=True, reason=reason)
+
+        self.recalculate_bandwidth()
+        # give downloaded a chance to repick
+        self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
+
+    def all_work_done(self):
+        """True once every swarm hsa finalized. used to stop churns self-reschduling"""
+        if not all(s.is_finalized for s in self.swarms.values()):
+            return False
+        for agent in self.agents:
+            for t_id in agent.strategies:
+                if agent.finish_time.get(t_id) is None:
+                    return False
+        return True
+
+    def start_churn(self, agent, mean_up_duration, mean_down_duration):
+        """Kick off randomized on/off churn for a 'bad' peer"""
+        agent.churn_mean_up = mean_up_duration
+        agent.churn_mean_down = mean_down_duration
+        up = random.expovariate(1.0 / mean_up_duration)
+        self.schedule(up, "CHURN_DEPART", agent, data=None)
+
     def append_pieces(self, torrent_id, count, publisher_agent):
         """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
         swarm = self.swarms[torrent_id]
@@ -280,6 +320,29 @@ class TorrentSim:
                 torrent_id, count = data
                 self.append_pieces(torrent_id, count, agent)
 
+            elif event_type == "CHURN_DEPART":
+                agent.is_available = False
+                self.log_event("CHURN_DEPART", agent_id=agent.agent_id)
+                # a dropped connection kills up/down
+                for t in list(agent.active_uploads) + list(agent.active_downloads):
+                    self.cancel_transfer(t, reason="churn")
+                if not self.all_work_done():
+                    down = random.expovariate(1.0 / agent.churn_mean_down)
+                    self.schedule(down, "CHURN_REJOIN", agent, data=None)
+            
+            elif event_type == "CHURN_REJOIN":
+                agent.is_available = True
+                self.log_event("CHURN_REJOIN", agent_id=agent.agent_id)
+                # wake up peers that this agent is a source
+                for t_id in agent.strategies:
+                    swarm = self.swarms[t_id]
+                    for peer in swarm.participants:
+                        if peer is not agent and not any(t.torrent_id == t_id for t in peer.active_downloads):
+                            self.schedule(0.0, "PICK_PIECE", peer, data=t_id)
+                if not self.all_work_done():
+                    up = random.expovariate(1.0 / agent.churn_mean_up)
+                    self.schedule(up, "CHURN_DEPART", agent, data=None)
+
             elif event_type == "MOVE_TICK":
                 torrent_id, interval = data
                 agent.try_walk_step(self, torrent_id)
@@ -351,6 +414,12 @@ class Agent:
 
         # which swarms this agent seeds
         self.seeded_torrents = set()
+
+        # churn/reliability
+        self.is_bad = False
+        self.is_available = True
+        self.churn_mean_up = None
+        self.churn_mean_down = None
 
         # continuous time tracking sets
         self.active_uploads = set()
@@ -449,17 +518,21 @@ class Agent:
         for p in range(swarm.published_pieces):
             if strat == "cascading":
                 upstream = self.upstream_peers.get(torrent_id)
-                if upstream and p in upstream.completed_pieces[torrent_id]:
+                if upstream and upstream.is_available and p in upstream.completed_pieces[torrent_id]:
                     r_i_sum += 1
             else:
                 r_i_sum += sum(
                     1 for peer in swarm.participants 
-                    if p in peer.completed_pieces[torrent_id]
+                    if peer is not self and peer.is_available and p in peer.completed_pieces[torrent_id]
                 )
         return r_i_sum / swarm.published_pieces
 
-    def get_metrics(self, sim, torrent_id, p_error=0.5):
+    def get_metrics(self, sim, torrent_id, p_error=None):
         """Return Throughput [Mbps], Sequentiality [0..1], Robustness [0..1]"""
+        # bad peer per Fan et al.
+        if p_error is None:
+            p_error = getattr(sim, "p_bad", 0.5)
+
         swarm = sim.swarms[torrent_id]
         start = self.start_time.get(torrent_id)
         finish = self.finish_time.get(torrent_id)
@@ -513,7 +586,7 @@ class Agent:
         target_agent = None
 
         # bitmap discovery is global (like zenoh gossip), only transfer will throttle
-        candidates = [p for p in swarm.participants if p is not self]
+        candidates = [p for p in swarm.participants if p is not self and p.is_available]
 
         # RAREST-RANDOM
         if strategy == "rarest_random":
@@ -549,7 +622,7 @@ class Agent:
         elif strategy == "cascading":
             # check if current bound target peer still has missing pieces to offer
             upstream = self.upstream_peers.get(torrent_id)
-            if upstream is not None:
+            if upstream is not None and upstream.is_available:
                 available = upstream.completed_pieces[torrent_id] & missing
                 if available:
                     chosen_piece = min(available)
@@ -621,7 +694,7 @@ if __name__=="__main__":
     # each swarm has a fixed mapping horizon D so the run terminates
     # predictably.
     random.seed(42)  # reproducible heterogeneous radio spawns
-    STRATEGY = "cascading"
+    STRATEGY = "sequential"
 
     sim = TorrentSim()
 
@@ -629,6 +702,11 @@ if __name__=="__main__":
     TICK_INTERVAL = 2.0
     MOVE_INTERVAL = 1.5   # seconds per physical unit-step, same for every agent
     MAX_SIM_TIME = 5000.0  # safety backstop -- see TorrentSim.run() docstring
+
+    P_BAD = 0.0                # probability a given peer is "bad" (Fan et al.'s p)
+    CHURN_MEAN_UP = 15.0       # mean seconds a bad peer stays available before dropping
+    CHURN_MEAN_DOWN = 5.0      # mean seconds a bad peer stays gone before rejoining
+    sim.p_bad = P_BAD          # read by get_metrics() for the reported robustness score
 
     # --- Build one swarm per cardinal direction ---
     swarms = {}
@@ -697,6 +775,10 @@ if __name__=="__main__":
                 is_target=(name == target_dir),
             )
         sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL)
+        peer.is_bad = random.random() < P_BAD
+        if peer.is_bad:
+            sim.start_churn(peer, CHURN_MEAN_UP, CHURN_MEAN_DOWN)
+
         peers.append(peer)
 
     sim.agents = all_agents
@@ -755,6 +837,7 @@ if __name__=="__main__":
                 "target_torrent_id": agent.target_torrent_id,
                 "role": role,
                 "strategy": "(source)" if is_seed else agent.strategies[t_id]["strategy"],
+                "is_bad": agent.is_bad,
                 "throughput_mbps": t,
                 "sequentiality": s,
                 "robustness": r,
@@ -792,7 +875,7 @@ if __name__=="__main__":
     # are included with blank T/S/R fields (not the string "n/a") so a
     # CSV reader treats them as missing values rather than text.
     metrics_path = f"{STRATEGY}.csv"
-    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy",
+    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad",
                   "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps", "start_time", "finish_time"]
     with open(metrics_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
