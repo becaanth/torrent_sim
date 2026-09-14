@@ -4,14 +4,20 @@ import math
 from collections import Counter
 import json
 import csv
+import os
+import itertools
 
 import pdb
 
-CARDINAL_DIRECTIONS = {
-    "N": (0.0, 1.0),
-    "E": (1.0, 0.0),
-    "S": (0.0, -1.0),
-    "W": (-1.0, 0.0),
+DIRECTIONS = {
+    "N":  (0.0, 1.0),
+    "NE": (0.7071, 0.7071),   # normalized -- must stay unit length
+    "E":  (1.0, 0.0),
+    "SE": (0.7071, -0.7071),
+    "S":  (0.0, -1.0),
+    "SW": (-0.7071, -0.7071),
+    "W":  (-1.0, 0.0),
+    "NW": (-0.7071, 0.7071),
 }
 
 def random_radio_profile(rng=random, c_max_range=(6.0, 14.0),
@@ -200,11 +206,11 @@ class TorrentSim:
 
         self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
         # wake up any idle neighbours in this swarm (Fixes cascading pipeline stall)
-        for neighbours in swarm.participants:
+        for peer in swarm.participants:
             if peer is downloader:
                 continue
-            if not any(t.torrent_id == t_id for t in neighbours.active_downloads):
-                self.schedule(0.0, "PICK_PIECE", neighbours, data=t_id)
+            if not any(t.torrent_id == t_id for t in peer.active_downloads):
+                self.schedule(0.0, "PICK_PIECE", peer, data=t_id)
 
     def cancel_transfer(self, transfer, reason="churn"):
         """abort in-progress transfer (dont mark piece as completed)"""
@@ -283,7 +289,7 @@ class TorrentSim:
         swarm = self.swarms[torrent_id]
         cascading_peers = [
             p for p in swarm.participants
-            if p is not seeder and p.strategies[torrent_id]["strategy"] == "cascading"
+            if p is not seeder_agent and p.strategies[torrent_id]["strategy"] == "cascading"
         ]
         rng.shuffle(cascading_peers)
 
@@ -683,6 +689,162 @@ class Agent:
                 piece_id=chosen_piece
             )
 
+
+
+
+def build_simulation_from_config(config):
+    """Build a fully-wired, ready-to-run TorrentSim from a validated
+    ScenarioConfig (see experiment_config.py). Reusable equivalent of the
+    __main__ demo below, driven by config fields instead of hardcoded
+    constants, so scenario/sweep YAMLs can build arbitrary trials without
+    duplicating this setup logic per script.
+
+    Returns (sim, all_agents, log_header) -- log_header is the pre-run
+    replay-log snapshot, captured here since build_header() must run
+    before any events are scheduled.
+    """
+    if config.simulation.seed is not None:
+        random.seed(config.simulation.seed)
+
+    sim = TorrentSim()
+    sim.p_bad = config.churn.p_bad
+
+    swarms = {}
+    for name in config.topology.directions:
+        swarms[name] = Swarm(
+            torrent_id=name,
+            direction=DIRECTIONS[name],
+            initial_pieces=1,
+            piece_size_mb=1,
+            max_pieces=config.topology.horizon_for(name),
+        )
+        sim.add_swarm(swarms[name])
+
+    all_agents = []
+    next_agent_id = [0]
+
+    def spawn_agent(radio_overrides=None, **kwargs):
+        if config.radio.mode == "random":
+            rr = config.radio.random_ranges
+            profile = random_radio_profile(c_max_range=rr.c_max, d0_range=rr.d0, gamma_range=rr.gamma)
+        else:
+            f = config.radio.fixed
+            profile = {"radio_c_max": f.c_max, "radio_d0": f.d0, "radio_gamma": f.gamma}
+        for key, value in (radio_overrides or {}).items():
+            profile[f"radio_{key}"] = value
+        agent = Agent(agent_id=next_agent_id[0], **profile, **kwargs)
+        next_agent_id[0] += 1
+        all_agents.append(agent)
+        return agent
+
+    seeders = {}
+    for seeder_spec in config.agents.seeders:
+        name = seeder_spec.direction
+        seeder = spawn_agent(position=(0.0, 0.0), radio_overrides=seeder_spec.radio_overrides)
+        seeder.join_swarm(swarms[name], strategy="rarest_random", is_seeder=True, is_target=True)
+        seeders[name] = seeder
+        sim.start_seeder(seeder, name, interval=config.simulation.tick_interval)
+
+    all_peers = []
+    for group in config.agents.peers:
+        target_cycle = itertools.cycle(group.target)  # round-robin, not random -- deterministic, even coverage
+        for _ in range(group.count):
+            target_dir = next(target_cycle)
+            peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides)
+            for name in config.topology.directions:
+                peer.join_swarm(
+                    swarms[name],
+                    strategy=group.strategy,
+                    hybrid_s=group.hybrid_s,
+                    segment_k=group.segment_k,
+                    is_target=(name == target_dir),
+                )
+            sim.start_walker(peer, target_dir, interval=config.simulation.move_interval)
+
+            peer.is_bad = random.random() < config.churn.p_bad
+            if peer.is_bad:
+                sim.start_churn(peer, config.churn.mean_up, config.churn.mean_down)
+
+            all_peers.append(peer)
+
+    sim.agents = all_agents
+
+    for name in config.topology.directions:
+        sim.assign_cascade_chain(name, seeders[name])  # no-op if no cascading peers in this swarm
+
+    log_header = sim.build_header()
+
+    for agent in all_agents:
+        for name in config.topology.directions:
+            if name in agent.strategies:
+                sim.schedule(0.0, "PICK_PIECE", agent, data=name)
+
+    return sim, all_agents, log_header
+
+
+def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
+    """Write metrics.csv (always) and sim_log.json (if write_log) to
+    output_dir. Same per-session TRS + throughput-ceiling logic as the
+    __main__ demo, factored out so a runner script can call it once per
+    trial without duplicating it. Returns the metrics row list (e.g. for
+    a sweep runner to fold into a summary.csv across many trials)."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    swarm_t_max = {}
+    for t_id, swarm in sim.swarms.items():
+        peers_in_swarm = [p for p in swarm.participants if t_id not in p.seeded_torrents]
+        seed_agents = [p for p in swarm.participants if t_id in p.seeded_torrents]
+        n_peers = len(peers_in_swarm)
+        if n_peers == 0:
+            swarm_t_max[t_id] = None
+            continue
+        u_s = seed_agents[0].upload_speed if seed_agents else 0.0
+        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_peers
+        swarm_t_max[t_id] = (u_s + n_peers * u_p_avg) / n_peers
+
+    metrics_rows = []
+    for agent in all_agents:
+        for t_id in agent.strategies:
+            if agent.start_time.get(t_id) is None or agent.finish_time.get(t_id) is None:
+                continue
+
+            is_seed = t_id in agent.seeded_torrents
+            role = "SEED" if is_seed else ("TARGET" if t_id == agent.target_torrent_id else "relay")
+            t, s, r = (None, None, None) if is_seed else agent.get_metrics(sim, t_id)
+
+            metrics_rows.append({
+                "agent_id": agent.agent_id,
+                "torrent_id": t_id,
+                "target_torrent_id": agent.target_torrent_id,
+                "role": role,
+                "strategy": "(source)" if is_seed else agent.strategies[t_id]["strategy"],
+                "is_bad": agent.is_bad,
+                "throughput_mbps": t,
+                "sequentiality": s,
+                "robustness": r,
+                "n_peers": None if is_seed else len(
+                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
+                "t_max_mbps": None if is_seed else swarm_t_max[t_id],
+                "start_time": agent.start_time[t_id],
+                "finish_time": agent.finish_time[t_id],
+            })
+
+    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad",
+                  "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps",
+                  "start_time", "finish_time"]
+    with open(os.path.join(output_dir, "metrics.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+
+    if write_log:
+        with open(os.path.join(output_dir, "sim_log.json"), "w") as f:
+            json.dump({"header": log_header, "events": sim.log}, f)
+
+    return metrics_rows
+
+
+
 if __name__=="__main__":
     # NEW DEMO: multi-directional mapping scenario.
     #
@@ -694,23 +856,23 @@ if __name__=="__main__":
     # each swarm has a fixed mapping horizon D so the run terminates
     # predictably.
     random.seed(42)  # reproducible heterogeneous radio spawns
-    STRATEGY = "sequential"
+    STRATEGY = "rarest_random"
 
     sim = TorrentSim()
 
-    HORIZON_D = 500
+    HORIZON_D = 100
     TICK_INTERVAL = 2.0
     MOVE_INTERVAL = 1.5   # seconds per physical unit-step, same for every agent
     MAX_SIM_TIME = 100000.0  # safety backstop -- see TorrentSim.run() docstring
 
-    P_BAD = 0.0                # probability a given peer is "bad" (Fan et al.'s p)
+    P_BAD = 0.2                # probability a given peer is "bad" (Fan et al.'s p)
     CHURN_MEAN_UP = 15.0        # mean seconds a bad peer stays available before dropping
     CHURN_MEAN_DOWN = 5.0      # mean seconds a bad peer stays gone before rejoining
     sim.p_bad = P_BAD          # read by get_metrics() for the reported robustness score
 
     # --- Build one swarm per cardinal direction ---
     swarms = {}
-    for name, direction in CARDINAL_DIRECTIONS.items():
+    for name, direction in DIRECTIONS.items():
         swarms[name] = Swarm(
             torrent_id=name,
             direction=direction,
@@ -736,7 +898,7 @@ if __name__=="__main__":
         else:
             profile =  {
                 "radio_c_max": 10.0,
-                "radio_d0": 10000.0,
+                "radio_d0": 10.0,
                 "radio_gamma": 2.0,
             }
             
@@ -749,7 +911,7 @@ if __name__=="__main__":
 
     # --- One seeder per direction, all starting at the shared root ---
     seeders = {}
-    for name in CARDINAL_DIRECTIONS:
+    for name in DIRECTIONS:
         seeder = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
         seeder.join_swarm(swarms[name], strategy="rarest_random",
                            is_seeder=True, is_target=True)
@@ -764,28 +926,40 @@ if __name__=="__main__":
         ("N", STRATEGY),
         ("N", STRATEGY),
         ("N", STRATEGY),
-        ("N", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
         ("E", STRATEGY),
         ("E", STRATEGY),
         ("E", STRATEGY),
         ("E", STRATEGY),
-        ("E", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
         ("S", STRATEGY),
         ("S", STRATEGY),
         ("S", STRATEGY),
         ("S", STRATEGY),
-        ("S", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
         ("W", STRATEGY),
         ("W", STRATEGY),
         ("W", STRATEGY),
         ("W", STRATEGY),
-        ("W", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
     ]
 
     peers = []
     for target_dir, strategy in peer_plan:
         peer = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
-        for name in CARDINAL_DIRECTIONS:
+        for name in DIRECTIONS:
             # Every peer joins every swarm (full participation), but only
             # its target direction is marked is_target=True so that
             # progress there is what actually moves it through space.
@@ -805,14 +979,14 @@ if __name__=="__main__":
 
     # NEW: lock in each swarm's cascade chain now, once, before anything
     # runs -- a single random shuffle per swarm, never touched again.
-    for name in CARDINAL_DIRECTIONS:
+    for name in DIRECTIONS:
         sim.assign_cascade_chain(name, seeders[name])
 
     log_header = sim.build_header()
 
     # Kick off piece-picking for every agent across every swarm it joined.
     for agent in all_agents:
-        for name in CARDINAL_DIRECTIONS:
+        for name in DIRECTIONS:
             if name in agent.strategies:
                 sim.schedule(0.0, "PICK_PIECE", agent, data=name)
 
@@ -895,6 +1069,234 @@ if __name__=="__main__":
     # are included with blank T/S/R fields (not the string "n/a") so a
     # CSV reader treats them as missing values rather than text.
     metrics_path = f"{STRATEGY}.csv"
+    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad",
+                  "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps", "start_time", "finish_time"]
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+    print(f"Per-session TRS metrics written to {metrics_path} ({len(metrics_rows)} rows).")    # NEW DEMO: multi-directional mapping scenario.
+    #
+    # Four seeders map outward from a shared root (0,0), one per cardinal
+    # direction, each its own swarm/torrent. Several peer robots each
+    # target one direction (their physical path) while still fully
+    # participating (downloading + relaying) in every other swarm. Radio
+    # hardware is heterogeneous per-agent via random_radio_profile(), and
+    # each swarm has a fixed mapping horizon D so the run terminates
+    # predictably.
+    random.seed(42)  # reproducible heterogeneous radio spawns
+    STRATEGY = "rarest_random"
+
+    sim = TorrentSim()
+
+    HORIZON_D = 100
+    TICK_INTERVAL = 2.0
+    MOVE_INTERVAL = 1.5   # seconds per physical unit-step, same for every agent
+    MAX_SIM_TIME = 100000.0  # safety backstop -- see TorrentSim.run() docstring
+
+    P_BAD = 0.2                # probability a given peer is "bad" (Fan et al.'s p)
+    CHURN_MEAN_UP = 15.0        # mean seconds a bad peer stays available before dropping
+    CHURN_MEAN_DOWN = 5.0      # mean seconds a bad peer stays gone before rejoining
+    sim.p_bad = P_BAD          # read by get_metrics() for the reported robustness score
+
+    # --- Build one swarm per cardinal direction ---
+    swarms = {}
+    for name, direction in DIRECTIONS.items():
+        swarms[name] = Swarm(
+            torrent_id=name,
+            direction=direction,
+            initial_pieces=1,       # just the shared root to start
+            piece_size_mb=1,
+            max_pieces=HORIZON_D,
+        )
+        sim.add_swarm(swarms[name])
+
+    all_agents = []
+    next_agent_id = 0
+    use_random_radio = False
+
+    def spawn_agent(use_random_radio=True, **kwargs):
+        """Helper: assign the next agent_id and either a randomized radio profile
+        or default Agent radio parameters unless overridden."""
+        global next_agent_id
+        radio_overrides = kwargs.pop("radio_overrides", {})
+        
+        profile = {}
+        if use_random_radio:
+            profile = random_radio_profile()
+        else:
+            profile =  {
+                "radio_c_max": 10.0,
+                "radio_d0": 100.0,
+                "radio_gamma": 2.0,
+            }
+            
+        profile.update(radio_overrides)
+        
+        agent = Agent(agent_id=next_agent_id, **profile, **kwargs)
+        next_agent_id += 1
+        all_agents.append(agent)
+        return agent
+
+    # --- One seeder per direction, all starting at the shared root ---
+    seeders = {}
+    for name in DIRECTIONS:
+        seeder = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
+        seeder.join_swarm(swarms[name], strategy="rarest_random",
+                           is_seeder=True, is_target=True)
+        seeders[name] = seeder
+        sim.start_seeder(seeder, name, interval=TICK_INTERVAL)
+
+    # --- N peers per target path, each fully participating in every swarm ---
+    # (direction, strategy) pairs — feel free to vary these to compare
+    # piece-picking strategies head-to-head on the same map.
+    peer_plan = [
+        ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("N", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
+        ("NE", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
+        ("E", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
+        ("SE", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("S", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
+        ("SW", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
+        ("W", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
+        ("NW", STRATEGY),
+    ]
+
+    peers = []
+    for target_dir, strategy in peer_plan:
+        peer = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
+        for name in DIRECTIONS:
+            # Every peer joins every swarm (full participation), but only
+            # its target direction is marked is_target=True so that
+            # progress there is what actually moves it through space.
+            peer.join_swarm(
+                swarms[name],
+                strategy=strategy,
+                is_target=(name == target_dir),
+            )
+        sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL)
+        peer.is_bad = random.random() < P_BAD
+        if peer.is_bad:
+            sim.start_churn(peer, CHURN_MEAN_UP, CHURN_MEAN_DOWN)
+
+        peers.append(peer)
+
+    sim.agents = all_agents
+
+    # NEW: lock in each swarm's cascade chain now, once, before anything
+    # runs -- a single random shuffle per swarm, never touched again.
+    for name in DIRECTIONS:
+        sim.assign_cascade_chain(name, seeders[name])
+
+    log_header = sim.build_header()
+
+    # Kick off piece-picking for every agent across every swarm it joined.
+    for agent in all_agents:
+        for name in DIRECTIONS:
+            if name in agent.strategies:
+                sim.schedule(0.0, "PICK_PIECE", agent, data=name)
+
+    print("=" * 90)
+    print("MULTI-DIRECTIONAL MAPPING SIMULATION")
+    print(f"Horizon D={HORIZON_D} pieces/direction, tick interval={TICK_INTERVAL}s")
+    print("=" * 90)
+    for agent in all_agents:
+        print(f"Agent {agent.agent_id:2d} | radio c_max={agent.radio_c_max:5.2f} "
+              f"d0={agent.radio_d0:5.2f} gamma={agent.radio_gamma:4.2f} "
+              f"| target={agent.target_torrent_id}")
+    print("-" * 90)
+
+    sim.run(max_time=MAX_SIM_TIME)
+
+    # Per-swarm achievable throughput ceiling, computed once per swarm:
+    swarm_t_max = {}
+    for t_id, swarm in sim.swarms.items():
+        peers_in_swarm = [p for p in swarm.participants if t_id not in p.seeded_torrents]
+        seed_agents = [p for p in swarm.participants if t_id in p.seeded_torrents]
+        n_peers = len(peers_in_swarm)
+        if n_peers == 0:
+            swarm_t_max[t_id] = None
+            continue
+        u_s = seed_agents[0].upload_speed if seed_agents else 0.0
+        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_peers
+        swarm_t_max[t_id] = (u_s + n_peers * u_p_avg) / n_peers
+
+    metrics_rows = []
+    for agent in all_agents:
+        for t_id in agent.strategies:
+            if agent.start_time.get(t_id) is None or agent.finish_time.get(t_id) is None:
+                continue  # this session never completed (or never started)
+
+            is_seed = t_id in agent.seeded_torrents
+            role = "SEED" if is_seed else ("TARGET" if t_id == agent.target_torrent_id else "relay")
+            t, s, r = (None, None, None) if is_seed else agent.get_metrics(sim, t_id)
+
+            metrics_rows.append({
+                "agent_id": agent.agent_id,
+                "torrent_id": t_id,
+                "target_torrent_id": agent.target_torrent_id,
+                "role": role,
+                "strategy": "(source)" if is_seed else agent.strategies[t_id]["strategy"],
+                "is_bad": agent.is_bad,
+                "throughput_mbps": t,
+                "sequentiality": s,
+                "robustness": r,
+                "n_peers": None if is_seed else len(
+                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
+                "t_max_mbps": None if is_seed else swarm_t_max[t_id],
+                "start_time": agent.start_time[t_id],
+                "finish_time": agent.finish_time[t_id],
+            })
+
+
+    print("\n" + "=" * 100)
+    print("PER-SESSION TRS METRICS")
+    print("Each agent gets one row per swarm it participated in (target path")
+    print("plus every swarm it relayed for), not just its own target.")
+    print("=" * 100)
+    print(f"{'Agent ID':<10} | {'Swarm':<6} | {'Role':<8} | {'Strategy':<15} | {'Throughput':<12} | {'Sequentiality':<14} | {'Robustness'}")
+    print("-" * 100)
+    for row in metrics_rows:
+        if row["role"] == "SEED":
+            print(f"Agent {row['agent_id']:<4} | {row['torrent_id']:<6} | {'SEED':<8} | "
+                  f"{'(source)':<15} | {'n/a':<12} | {'n/a':<14} | n/a")
+        else:
+            print(f"Agent {row['agent_id']:<4} | {row['torrent_id']:<6} | {row['role']:<8} | {row['strategy']:<15} | "
+                  f"{row['throughput_mbps']:6.2f} Mbps  | {row['sequentiality']:6.4f}       | {row['robustness']:6.4f}")
+
+    # Write the replay log for render_sim.py...
+    log_path = f"json/{STRATEGY}_log.json"
+    with open(log_path, "w") as f:
+        json.dump({"header": log_header, "events": sim.log}, f)
+    print(f"\nReplay log written to {log_path} ({len(sim.log)} events).")
+
+    # ...and the per-session TRS table for a separate metrics/plotting
+    # script (ternary plot, scatter, etc. -- to be scoped next). Seed rows
+    # are included with blank T/S/R fields (not the string "n/a") so a
+    # CSV reader treats them as missing values rather than text.
+    metrics_path = f"csv/{STRATEGY}.csv"
     fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad",
                   "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps", "start_time", "finish_time"]
     with open(metrics_path, "w", newline="") as f:

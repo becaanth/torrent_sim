@@ -1,0 +1,32 @@
+scenario:
+  name: base_convoy
+  description: >
+    Neutral base environment for comparing pickers head-to-head via
+    --compare-strategies. The `strategy` field below is a placeholder --
+    it gets overridden per variant, so its value here doesn't matter.
+  hypothesis: null
+
+simulation:
+  seed: 42
+  max_sim_time: 10000.0
+  tick_interval: 2.0
+  move_interval: 1.5
+
+topology:
+  directions: [E]
+  horizon: 500
+
+churn:
+  p_bad: 0.0
+  mean_up: 15.0
+  mean_down: 5.0
+
+radio:
+  mode: fixed
+  fixed: {c_max: 10.0, d0: 100.0, gamma: 2.0}
+
+agents:
+  seeders:
+    - {direction: E}
+  peers:
+    - {count: 8, target: [E, E, E, E, E, E, E, E, E, E, E], strategy: rarest_random}

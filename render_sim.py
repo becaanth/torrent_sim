@@ -131,11 +131,19 @@ def render(log_path, out_path, n_frames=150, fps=15):
                markeredgecolor="black", markersize=8, label="seed")
     ]
 
-    fig = plt.figure(figsize=(13, 7))
-    grid = fig.add_gridspec(2, 3, width_ratios=[2, 1, 1])
+    # Bitmap panel grid sizes itself to however many swarms are actually
+    # in the log -- previously hardcoded to a 2x2 sub-grid (index error
+    # past 4 swarms, wasted space below 4). Caps at 4 columns wide so it
+    # stays roughly square-ish rather than one long row for 8 swarms.
+    n_swarms = len(swarms)
+    bitmap_cols = min(4, n_swarms) or 1
+    bitmap_rows = -(-n_swarms // bitmap_cols)  # ceil division
+
+    fig = plt.figure(figsize=(6 + 3 * bitmap_cols, 3.2 * bitmap_rows))
+    grid = fig.add_gridspec(bitmap_rows, 1 + bitmap_cols, width_ratios=[2] + [1] * bitmap_cols)
     ax_world = fig.add_subplot(grid[:, 0])
     bitmap_axes = {
-        tid: fig.add_subplot(grid[i // 2, 1 + i % 2])
+        tid: fig.add_subplot(grid[i // bitmap_cols, 1 + i % bitmap_cols])
         for i, tid in enumerate(swarms)
     }
 
@@ -182,11 +190,11 @@ def render(log_path, out_path, n_frames=150, fps=15):
         # agent marker's color/shape means. ax_world.clear() above wipes
         # any previous legend, so these get redrawn every frame from the
         # static handles built once outside the loop.
-        # swarm_legend = ax_world.legend(handles=swarm_legend_handles, loc="upper left",
-        #                                 fontsize=6, title="Swarm (path/arrow)", title_fontsize=7)
-        # ax_world.add_artist(swarm_legend)
-        # ax_world.legend(handles=role_legend_handles, loc="lower left",
-        #                  fontsize=6, title="Agent role", title_fontsize=7)
+        swarm_legend = ax_world.legend(handles=swarm_legend_handles, loc="upper left",
+                                        fontsize=6, title="Swarm (path/arrow)", title_fontsize=7)
+        ax_world.add_artist(swarm_legend)
+        ax_world.legend(handles=role_legend_handles, loc="lower left",
+                         fontsize=6, title="Agent role", title_fontsize=7)
 
         # --- bitmap panels: one per swarm ---
         for tid, ax in bitmap_axes.items():
@@ -227,9 +235,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("log", nargs="?", default="sim_log.json")
     parser.add_argument("--out", default="sim_render.mp4")
-    parser.add_argument("--frames", type=int, default=150)
-    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--frames", type=int, default=100)
+    parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()
 
+    # argslog = f"json/{args.log}"
+    # argsout = f"vids/{args.out}"
     out = render(args.log, args.out, n_frames=args.frames, fps=args.fps)
     print(f"Wrote {out}")
