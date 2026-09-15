@@ -95,9 +95,24 @@ class RadioConfig(BaseModel):
     random_ranges: RadioRanges = Field(default_factory=RadioRanges)
 
 
+RADIO_FIELDS = {"c_max", "d0", "gamma"}
+
+
+def _check_radio_overrides(overrides):
+    bad = set(overrides) - RADIO_FIELDS
+    if bad:
+        raise ValueError(f"radio_overrides key(s) {sorted(bad)} not in {sorted(RADIO_FIELDS)}")
+    return overrides
+
+
 class SeederSpec(BaseModel):
     direction: str
     radio_overrides: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_overrides(self):
+        _check_radio_overrides(self.radio_overrides)
+        return self
 
 
 class PeerGroupSpec(BaseModel):
@@ -110,6 +125,7 @@ class PeerGroupSpec(BaseModel):
 
     @model_validator(mode="after")
     def _check_group(self):
+        _check_radio_overrides(self.radio_overrides)
         if self.strategy not in KNOWN_STRATEGIES:
             raise ValueError(f"strategy '{self.strategy}' not in {sorted(KNOWN_STRATEGIES)}")
         if self.count <= 0:
@@ -187,9 +203,25 @@ class VarySpec(BaseModel):
 
 class SweepConfig(BaseModel):
     base: str
-    trials: int
-    vary: dict[str, VarySpec]
+    # Cartesian-product axes: dotted-path -> list of values. Every
+    # combination across every axis gets run. Paths can index into list
+    # elements too (e.g. "agents.peers.0.strategy": [...]) -- see
+    # _set_dotted below.
+    grid: dict[str, list] = Field(default_factory=dict)
+    # How many times to repeat each grid point (or, if grid is empty, the
+    # total trial count) -- each repeat gets a fresh seed automatically
+    # unless simulation.seed is itself a grid/vary axis.
+    repeats: int = 1
+    # Additional per-trial random variation layered on top of each grid
+    # point/repeat (e.g. randomizing something grid doesn't cover).
+    vary: dict[str, VarySpec] = Field(default_factory=dict)
     write_logs: bool = False  # opt-in per sweep; off by default given trial counts
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not self.grid and not self.vary and self.repeats <= 1:
+            raise ValueError("sweep needs at least one of: grid, vary, or repeats > 1")
+        return self
 
     @classmethod
     def from_yaml(cls, path):
@@ -199,22 +231,39 @@ class SweepConfig(BaseModel):
 
 
 def _set_dotted(d, dotted_key, value):
+    """Set a value at a dotted config path, e.g. "churn.p_bad" or
+    "agents.peers.0.strategy" -- numeric path segments index into a list
+    (int) rather than a dict key, so this can reach into agents.peers[i]
+    the way a strategy-comparison grid sweep needs to."""
     parts = dotted_key.split(".")
     node = d
     for p in parts[:-1]:
-        node = node.setdefault(p, {})
-    node[parts[-1]] = value
+        key = int(p) if p.isdigit() else p
+        node = node[key] if isinstance(node, list) else node.setdefault(key, {})
+    last = parts[-1]
+    node[int(last) if last.isdigit() else last] = value
 
 
 def resolve_sweep(sweep, base_dir="."):
     """Expand a SweepConfig into a list of (trial_index, ScenarioConfig,
-    overrides_dict) tuples, one per trial. Each trial's overrides are
-    sampled from a dedicated random.Random seeded off the base scenario's
-    seed (or 0), so resolution itself is reproducible independent of
-    whatever global `random` state torrent_sim.py's own simulation RNG is
-    in when this runs."""
+    record_dict) tuples. `record_dict` is every dotted-path override
+    actually applied for that trial, plus `repeat_index` -- meant to be
+    written straight into the manifest/summary, not re-applied as a
+    config override itself.
+
+    Trial ordering: outer loop over the Cartesian product of `grid`
+    (empty grid = a single implicit combo), inner loop over `repeats`.
+    Total trial count = len(grid combos) * repeats.
+
+    All sampling (both `vary` and the auto-assigned per-repeat seed) uses
+    a dedicated random.Random seeded off the base scenario's own seed (or
+    0), so resolution is reproducible independent of whatever global
+    `random` state torrent_sim.py's own simulation RNG is in when this
+    runs.
+    """
     import os
     import random as _random
+    import itertools
 
     base_path = sweep.base if os.path.isabs(sweep.base) else os.path.join(base_dir, sweep.base)
     with open(base_path) as f:
@@ -222,12 +271,36 @@ def resolve_sweep(sweep, base_dir="."):
     base_seed = (base_dict.get("simulation") or {}).get("seed") or 0
 
     rng = _random.Random(base_seed)
+
+    if sweep.grid:
+        keys = list(sweep.grid.keys())
+        combos = list(itertools.product(*(sweep.grid[k] for k in keys)))
+    else:
+        keys, combos = [], [()]
+
     resolved = []
-    for trial_index in range(sweep.trials):
-        overrides = {key: spec.sample(rng, trial_index, base_seed) for key, spec in sweep.vary.items()}
-        merged = copy.deepcopy(base_dict)
-        for dotted_key, value in overrides.items():
-            _set_dotted(merged, dotted_key, value)
-        scenario = ScenarioConfig.model_validate(merged)
-        resolved.append((trial_index, scenario, overrides))
+    trial_index = 0
+    for combo in combos:
+        grid_overrides = dict(zip(keys, combo))
+        for repeat in range(sweep.repeats):
+            overrides = dict(grid_overrides)
+            for dotted_key, spec in sweep.vary.items():
+                overrides[dotted_key] = spec.sample(rng, trial_index, base_seed)
+
+            # Auto-assign a fresh seed per trial so repeats actually
+            # differ, unless the user is already controlling
+            # simulation.seed explicitly via grid/vary.
+            if "simulation.seed" not in overrides:
+                overrides["simulation.seed"] = (base_seed or 0) + trial_index
+
+            merged = copy.deepcopy(base_dict)
+            for dotted_key, value in overrides.items():
+                _set_dotted(merged, dotted_key, value)
+            scenario = ScenarioConfig.model_validate(merged)
+
+            record = dict(overrides)
+            record["repeat_index"] = repeat
+            resolved.append((trial_index, scenario, record))
+            trial_index += 1
+
     return resolved

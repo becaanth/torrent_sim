@@ -244,7 +244,7 @@ def plot_maps_combined(scenario_logs, out_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--metrics", nargs="+",
-                         default=["csv/rarest_random.csv", "csv/sequential.csv", "csv/cascading.csv"],
+                         default=["csv/rarest_random.csv", "csv/sequential.csv", "csv/  python3 gem_metrics.py --metrics results/base_convoy/rarest_random.csv results/base_convoy/sequential.csv results/base_convoy/cascading.csvcascading.csv"],
                          help="Scenario CSVs for the R-vs-S scatter. Scenario label is "
                               "derived from each filename (e.g. rarest_random.csv -> 'Rarest Random').")
     parser.add_argument("--out", default="rs_scatter.png")

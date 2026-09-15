@@ -1,29 +1,11 @@
 scenario:
   name: base_multi
-  description: >
-    Neutral base environment for comparing pickers head-to-head via
-    --compare-strategies. The `strategy` field below is a placeholder --
-    it gets overridden per variant, so its value here doesn't matter.
   hypothesis: null
 
-simulation:
-  seed: 42
-  max_sim_time: 10000.0
-  tick_interval: 2.0
-  move_interval: 1.5
-
-topology:
-  directions: [N, NE, E, SE, S, SW, W, NW]
-  horizon: 100
-
-churn:
-  p_bad: 0.2
-  mean_up: 15.0
-  mean_down: 5.0
-
-radio:
-  mode: fixed
-  fixed: {c_max: 10.0, d0: 1000.0, gamma: 2.0}
+simulation: {seed: 42, max_sim_time: 200.0, tick_interval: 2.0, move_interval: 1.5}
+topology: {directions: [N, NE, E, SE, S, SW, W, NW], horizon: 25}
+churn: {p_bad: 0.0}
+radio: {mode: fixed, fixed: {c_max: 10.0, d0: 50.0, gamma: 2.0}}
 
 agents:
   seeders:
@@ -36,4 +18,4 @@ agents:
     - {direction: W}
     - {direction: NW}
   peers:
-    - {count: 32, target: [N, NE, E, SE, S, SW, W, NW], strategy: rarest_random}
+    - {count: 16, target: [N, NE, E, SE, S, SW, W, NW], strategy: rarest_random}

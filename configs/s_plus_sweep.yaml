@@ -1,0 +1,7 @@
+base: base_convoy.yaml
+grid:
+  # radio.fixed.d0: [10.0, 20.0, 50.0, 100.0, 200.0]
+  churn.p_bad: [0.0, 0.2, 0.4, 0.6, 0.8]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 2   # repeat each (d0, strategy) point 3x with different seeds, to average out noise
+write_logs: false

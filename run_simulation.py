@@ -114,6 +114,7 @@ def run_sweep(path):
     sweep = SweepConfig.from_yaml(path)
     base_dir = os.path.dirname(os.path.abspath(path))
     trials = resolve_sweep(sweep, base_dir=base_dir)
+    n_trials = len(trials)
 
     scenario_name = ScenarioConfig.from_yaml(
         sweep.base if os.path.isabs(sweep.base) else os.path.join(base_dir, sweep.base)
@@ -124,7 +125,8 @@ def run_sweep(path):
     manifest_path = os.path.join(sweep_root, "manifest.jsonl")
     summary_rows = []
 
-    print(f"Running sweep over '{scenario_name}': {sweep.trials} trials, "
+    print(f"Running sweep over '{scenario_name}': {n_trials} trials "
+          f"({len(sweep.grid)} grid axis(es) x {sweep.repeats} repeat(s)), "
           f"varying {list(sweep.vary.keys())}, logs {'ON' if sweep.write_logs else 'off'}")
 
     with open(manifest_path, "w") as manifest_f:
@@ -139,8 +141,8 @@ def run_sweep(path):
                 row.update(overrides)
                 summary_rows.append(row)
 
-            if (trial_index + 1) % max(1, sweep.trials // 20) == 0 or trial_index + 1 == sweep.trials:
-                print(f"  {trial_index + 1}/{sweep.trials} trials complete")
+            if (trial_index + 1) % max(1, n_trials // 20) == 0 or trial_index + 1 == n_trials:
+                print(f"  {trial_index + 1}/{n_trials} trials complete")
 
     if summary_rows:
         fieldnames = list(summary_rows[0].keys())
@@ -149,7 +151,7 @@ def run_sweep(path):
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
-        print(f"Done. {len(summary_rows)} rows across {sweep.trials} trials -> {summary_path}")
+        print(f"Done. {len(summary_rows)} rows across {n_trials} trials -> {summary_path}")
     else:
         print("Done, but no session rows were produced across any trial -- check the scenario config.")
 
@@ -157,7 +159,7 @@ def run_sweep(path):
 def is_sweep_file(path):
     with open(path) as f:
         raw = yaml.safe_load(f)
-    return "base" in raw and "trials" in raw
+    return "base" in raw
 
 
 if __name__ == "__main__":
