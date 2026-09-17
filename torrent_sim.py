@@ -40,6 +40,10 @@ class Swarm:
         self.is_finalized = False # flag for closing the stream
         self.participants = set()
 
+    def sorted_participants(self):
+        """Deterministic iteration order over participants"""
+        return sorted(self.participants, key=lambda a: a.agent_id)
+
     def piece_position(self, piece_id):
         """give a spatial position for the piece"""
         return (self.direction[0] * piece_id, self.direction[1] * piece_id)
@@ -206,7 +210,7 @@ class TorrentSim:
 
         self.schedule(0.0, "PICK_PIECE", downloader, data=t_id)
         # wake up any idle neighbours in this swarm (Fixes cascading pipeline stall)
-        for peer in swarm.participants:
+        for peer in swarm.sorted_participants():
             if peer is downloader:
                 continue
             if not any(t.torrent_id == t_id for t in peer.active_downloads):
@@ -241,12 +245,28 @@ class TorrentSim:
                     return False
         return True
 
-    def start_churn(self, agent, mean_up_duration, mean_down_duration):
-        """Kick off randomized on/off churn for a 'bad' peer"""
-        agent.churn_mean_up = mean_up_duration
-        agent.churn_mean_down = mean_down_duration
-        up = random.expovariate(1.0 / mean_up_duration)
-        self.schedule(up, "CHURN_DEPART", agent, data=None)
+    def start_churn(self, agent, p_bad, mean_down):
+        """Kick off randomized on/off churn for a every peer
+        p_bad is this peers long-run fraction of time spent unavailable
+        """
+        if p_bad <= 0.0:
+            return  # no churn at all for this peer
+        if p_bad >= 1.0:
+            raise ValueError(f"churn p_bad must be < 1.0 (got {p_bad}) -- a peer that's "
+                              f"always down can never contribute anything)")
+
+        mean_up = mean_down * (1.0 - p_bad) / p_bad
+        agent.churn_mean_up = mean_up
+        agent.churn_mean_down = mean_down
+
+        if random.random() < p_bad:
+            agent.is_available = False
+            self.log_event("CHURN_DEPART", agent_id=agent.agent_id)
+            down = random.expovariate(1.0 / mean_down)
+            self.schedule(down, "CHURN_REJOIN", agent, data=None)
+        else:
+            up = random.expovariate(1.0 / mean_up)
+            self.schedule(up, "CHURN_DEPART", agent, data=None)
 
     def append_pieces(self, torrent_id, count, publisher_agent):
         """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
@@ -271,7 +291,7 @@ class TorrentSim:
               f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
         
         # wake up idle leechers
-        for agent in swarm.participants:
+        for agent in swarm.sorted_participants():
             if agent != publisher_agent: 
                 self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
 
@@ -288,7 +308,7 @@ class TorrentSim:
         """IMO faithful cascading implementation - random connectivity chains at session start"""
         swarm = self.swarms[torrent_id]
         cascading_peers = [
-            p for p in swarm.participants
+            p for p in swarm.sorted_participants()
             if p is not seeder_agent and p.strategies[torrent_id]["strategy"] == "cascading"
         ]
         rng.shuffle(cascading_peers)
@@ -305,7 +325,7 @@ class TorrentSim:
         print(f"[Time {self.time:6.2f}s] FINALIZE: Swarm '{torrent_id}': Closed at {swarm.published_pieces} total pieces.")
 
         # Trigger idle leechers to evaluate total completion
-        for agent in swarm.participants:
+        for agent in swarm.sorted_participants():
             if not any(t.torrent_id == torrent_id for t in agent.active_downloads):
                 self.schedule(0.0, "PICK_PIECE", agent, data=torrent_id)
         
@@ -342,7 +362,7 @@ class TorrentSim:
                 # wake up peers that this agent is a source
                 for t_id in agent.strategies:
                     swarm = self.swarms[t_id]
-                    for peer in swarm.participants:
+                    for peer in swarm.sorted_participants():
                         if peer is not agent and not any(t.torrent_id == t_id for t in peer.active_downloads):
                             self.schedule(0.0, "PICK_PIECE", peer, data=t_id)
                 if not self.all_work_done():
@@ -351,12 +371,15 @@ class TorrentSim:
 
             elif event_type == "MOVE_TICK":
                 torrent_id, interval = data
-                agent.try_walk_step(self, torrent_id)
+                advanced = agent.try_walk_step(self, torrent_id)
                 swarm = self.swarms[torrent_id]
                 if (swarm.is_finalized and agent.walk_step >= swarm.published_pieces - 1):
                     if agent.walk_finish_time is None:
                         agent.walk_finish_time = self.time
                 else:
+                    # blocked, accrue wait time
+                    if not advanced:
+                        agent.wait_time += interval
                     self.schedule(interval, "MOVE_TICK", agent, data=(torrent_id, interval))
 
             elif event_type == "SEEDER_TICK":
@@ -421,7 +444,8 @@ class Agent:
         self.target_torrent_id = None
         self.walk_step = 0
         self.walk_finish_time = None  # sim time physical navigation actually completed (None until then)
-
+        self.wait_time = 0.0
+        
         # which swarms this agent seeds
         self.seeded_torrents = set()
 
@@ -450,7 +474,7 @@ class Agent:
 
     def join_swarm(self, swarm, strategy="rarest_random", hybrid_s=0.5, segment_k=5, upstream_peer=None, is_seeder=False, is_target=False):
         t_id = swarm.torrent_id
-        swarm.participants.add(self)
+        swarm.sorted_participants().add(self)
 
         if is_seeder:
             self.completed_pieces[t_id] = set(range(swarm.published_pieces))
@@ -497,7 +521,7 @@ class Agent:
         return math.sqrt(dx * dx + dy * dy)
 
     def try_walk_step(self, sim, torrent_id):
-        """try to advance on MOVE_TICK"""
+        """try to advance on MOVE_TICK. Returns True if successful"""
         swarm = sim.swarms[torrent_id]
         next_step = self.walk_step + 1
         if next_step in self.completed_pieces[torrent_id]:
@@ -505,6 +529,8 @@ class Agent:
             self.position = swarm.piece_position(self.walk_step)
             sim.log_event("POSITION", agent_id=self.agent_id,
                 x=self.position[0], y=self.position[1])
+            return True
+        return False
 
     def record_useful_chunks(self, sim, torrent_id):
         """U(x) per Eq. 10 in Fan et al."""
@@ -532,7 +558,7 @@ class Agent:
                     r_i_sum += 1
             else:
                 r_i_sum += sum(
-                    1 for peer in swarm.participants 
+                    1 for peer in swarm.sorted_participants() 
                     if peer is not self and peer.is_available and p in peer.completed_pieces[torrent_id]
                 )
         return r_i_sum / swarm.published_pieces
@@ -596,7 +622,7 @@ class Agent:
         target_agent = None
 
         # bitmap discovery is global (like zenoh gossip), only transfer will throttle
-        candidates = [p for p in swarm.participants if p is not self and p.is_available]
+        candidates = [p for p in swarm.sorted_participants() if p is not self and p.is_available]
 
         # RAREST-RANDOM
         if strategy == "rarest_random":
@@ -796,8 +822,8 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
 
     swarm_t_max = {}
     for t_id, swarm in sim.swarms.items():
-        peers_in_swarm = [p for p in swarm.participants if t_id not in p.seeded_torrents]
-        seed_agents = [p for p in swarm.participants if t_id in p.seeded_torrents]
+        peers_in_swarm = [p for p in swarm.sorted_participants() if t_id not in p.seeded_torrents]
+        seed_agents = [p for p in swarm.sorted_participants() if t_id in p.seeded_torrents]
         n_peers = len(peers_in_swarm)
         if n_peers == 0:
             swarm_t_max[t_id] = None
@@ -840,12 +866,13 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
                                               if (not is_seed and t_id == agent.target_torrent_id) else None),
                 "target_swarm_reachable_pieces_held": (agent.contiguous_length(agent.target_torrent_id)
                                                         if (not is_seed and t_id == agent.target_torrent_id) else None),
+                "wait_time": agent.wait_time/n_peers if (not is_seed and t_id == agent.target_torrent_id) else None,
             })
 
 
     fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad", "session_complete",
                   "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps",
-                  "start_time", "finish_time", "walk_step", "walk_finish_time", "total_pieces_held", "reachable_pieces_held", "target_swarm_pieces_held", "target_swarm_reachable_pieces_held"]
+                  "start_time", "finish_time", "walk_step", "walk_finish_time", "total_pieces_held", "reachable_pieces_held", "target_swarm_pieces_held", "target_swarm_reachable_pieces_held", "wait_time"]
     with open(os.path.join(output_dir, "metrics.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
