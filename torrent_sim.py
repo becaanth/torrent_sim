@@ -268,6 +268,7 @@ class TorrentSim:
             up = random.expovariate(1.0 / mean_up)
             self.schedule(up, "CHURN_DEPART", agent, data=None)
 
+
     def append_pieces(self, torrent_id, count, publisher_agent):
         """Append new pieces to the end of the seed (Append-only Mutable Torrent)"""
         swarm = self.swarms[torrent_id]
@@ -793,7 +794,7 @@ def build_simulation_from_config(config):
 
             peer.is_bad = random.random() < config.churn.p_bad
             if peer.is_bad:
-                sim.start_churn(peer, config.churn.mean_up, config.churn.mean_down)
+                sim.start_churn(peer, config.churn.p_bad, config.churn.mean_down)
 
             all_peers.append(peer)
 
@@ -982,7 +983,7 @@ if __name__=="__main__":
         sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL)
         peer.is_bad = random.random() < P_BAD
         if peer.is_bad:
-            sim.start_churn(peer, CHURN_MEAN_UP, CHURN_MEAN_DOWN)
+            sim.start_churn(peer, P_BAD, CHURN_MEAN_DOWN)
 
         peers.append(peer)
 
