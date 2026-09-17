@@ -32,6 +32,7 @@ Study YAML:
       - finish_time
       - map_possession_fraction           # normalized [0,1]: avg per-agent own-path pieces held / horizon
       - reachable_map_possession_fraction # normalized [0,1]: avg per-agent own-path contiguous pieces / horizon
+      - wait_time                         # SUMMED across peers: total fleet-wide time spent stalled
 
 Total trials = trajectories * (num_parameters + 1). Keep the base
 scenario cheap (small horizon/peer count) -- Morris needs many trials by
@@ -60,13 +61,19 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from experiment_config import ScenarioConfig, _set_dotted
-from run_simulation import run_one
+from run_simulation import run_one, run_trials_parallel
 
 # Metrics where "None" (an incomplete session) gets substituted with the
 # scenario's max_sim_time rather than dropped -- a right-censoring
 # convention: "never finished within budget" is itself informative and
 # excluding it would bias exactly the parameter regions where things fail.
 CENSORED_AT_MAX_TIME = {"finish_time", "walk_finish_time"}
+
+# Metrics reported as a SUM across TARGET peers rather than a mean --
+# e.g. wait_time, where the question is "how much total fleet-time was
+# spent stalled," which should scale with fleet size, not be averaged
+# away by it. Everything else defaults to a per-agent mean.
+SUMMED_METRICS = {"wait_time"}
 
 
 class MorrisParameter(BaseModel):
@@ -87,7 +94,7 @@ class MorrisConfig(BaseModel):
     levels: int = 4
     role_filter: str = "TARGET"
     outputs: list[str] = Field(default_factory=lambda: [
-        "finish_time", "map_possession_fraction", "reachable_map_possession_fraction"])
+        "finish_time", "map_possession_fraction", "reachable_map_possession_fraction", "wait_time"])
     write_logs: bool = False
 
     @classmethod
@@ -137,13 +144,15 @@ DERIVED_METRICS = {
 
 def reduce_trial(rows, outputs, role_filter, max_sim_time, topology_config=None):
     """Collapse one trial's full metrics.csv rows down to one scalar per
-    requested output metric, averaged over every row matching
-    role_filter (there may be several, e.g. multiple TARGET peers).
+    requested output metric: summed across every row matching
+    role_filter for outputs in SUMMED_METRICS (e.g. wait_time), averaged
+    otherwise (there may be several matching rows, e.g. multiple TARGET
+    peers).
 
     Outputs in DERIVED_METRICS are computed by first normalizing EACH
     row's raw value against that row's own swarm horizon (via
-    topology_config.horizon_for(row['torrent_id'])) before averaging --
-    not by averaging raw counts and normalizing once at the end -- so
+    topology_config.horizon_for(row['torrent_id'])) before aggregating --
+    not by aggregating raw counts and normalizing once at the end -- so
     this stays correct even if different TARGET rows belong to swarms
     with different horizon_overrides.
     """
@@ -165,37 +174,60 @@ def reduce_trial(rows, outputs, role_filter, max_sim_time, topology_config=None)
                 horizon = topology_config.horizon_for(r["torrent_id"])
                 v = v / horizon if horizon else float("nan")
             vals.append(v)
-        result[out] = (sum(vals) / len(vals)) if vals else float("nan")
+        if not vals:
+            result[out] = float("nan")
+        elif out in SUMMED_METRICS:
+            result[out] = sum(vals)
+        else:
+            result[out] = sum(vals) / len(vals)
     return result
 
 
-def run_trials_for_base(base_dict, problem, X, morris_config, out_dir, label=""):
+def run_trials_for_base(base_dict, problem, X, morris_config, out_dir, label="", n_jobs=1):
     """Run every row of a Morris sample matrix X against one fully-
     resolved base_dict, returning {output_name: [value_per_trial]}
     aligned to X's row order (required by SALib.analyze.morris). Shared
     by both run_morris_study (single base) and
     run_morris_compare_strategies (same X, multiple strategy-overridden
-    bases) so there's exactly one place this logic lives."""
+    bases) so there's exactly one place this logic lives.
+
+    Trials run via run_trials_parallel (processes, not threads -- see
+    its docstring). Each trial's ScenarioConfig is built here in the
+    parent up front (cheap: just dict overrides + pydantic validation),
+    so reduce_trial can use config.topology/max_sim_time after results
+    come back, without needing to carry the config object back across
+    the process boundary alongside the (possibly large) metrics rows.
+    """
     os.makedirs(out_dir, exist_ok=True)
     n_trials = len(X)
     prefix = f"{label}: " if label else ""
 
-    Y = {out: [] for out in morris_config.outputs}
+    configs, resolved_by_index, specs = {}, {}, []
+    for i, row in enumerate(X):
+        config, resolved = build_trial_config(base_dict, problem, row, morris_config)
+        configs[i] = config
+        resolved_by_index[i] = resolved
+        trial_dir = os.path.join(out_dir, f"trial_{i:05d}")
+        specs.append((i, config, trial_dir, morris_config.write_logs))
+
+    Y = {out: [None] * n_trials for out in morris_config.outputs}
     manifest_path = os.path.join(out_dir, "manifest.jsonl")
 
+    completed = 0
     with open(manifest_path, "w") as manifest_f:
-        for i, row in enumerate(X):
-            config, resolved = build_trial_config(base_dict, problem, row, morris_config)
-            trial_dir = os.path.join(out_dir, f"trial_{i:05d}")
-            rows = run_one(config, trial_dir, write_log=morris_config.write_logs)
+        for trial_index, rows in run_trials_parallel(specs, n_jobs=n_jobs):
+            config = configs[trial_index]
             reduced = reduce_trial(rows, morris_config.outputs, morris_config.role_filter,
                                     config.simulation.max_sim_time, topology_config=config.topology)
             for out in morris_config.outputs:
-                Y[out].append(reduced[out])
+                Y[out][trial_index] = reduced[out]
 
-            manifest_f.write(json.dumps({"trial_index": i, "params": resolved, "outputs": reduced}) + "\n")
-            if (i + 1) % max(1, n_trials // 20) == 0 or i + 1 == n_trials:
-                print(f"  {prefix}{i + 1}/{n_trials} trials complete")
+            manifest_f.write(json.dumps({"trial_index": trial_index,
+                                          "params": resolved_by_index[trial_index],
+                                          "outputs": reduced}) + "\n")
+            completed += 1
+            if completed % max(1, n_trials // 20) == 0 or completed == n_trials:
+                print(f"  {prefix}{completed}/{n_trials} trials complete")
 
     np.save(os.path.join(out_dir, "X.npy"), X)
     with open(os.path.join(out_dir, "problem.json"), "w") as f:
@@ -206,7 +238,7 @@ def run_trials_for_base(base_dict, problem, X, morris_config, out_dir, label="")
     return Y
 
 
-def run_morris_study(config_path, out_dir=None):
+def run_morris_study(config_path, out_dir=None, n_jobs=1):
     morris_config = MorrisConfig.from_yaml(config_path)
     base_dir = os.path.dirname(os.path.abspath(config_path))
     base_path = morris_config.base if os.path.isabs(morris_config.base) else os.path.join(base_dir, morris_config.base)
@@ -218,20 +250,23 @@ def run_morris_study(config_path, out_dir=None):
 
     problem, X = generate_samples(morris_config)
     print(f"Morris study on '{base_name}': {len(problem['names'])} parameters, "
-          f"{morris_config.trajectories} trajectories -> {len(X)} trials")
+          f"{morris_config.trajectories} trajectories -> {len(X)} trials, jobs={n_jobs}")
     print(f"Parameters: {problem['names']}")
 
-    Y = run_trials_for_base(base_dict, problem, X, morris_config, out_dir)
+    Y = run_trials_for_base(base_dict, problem, X, morris_config, out_dir, n_jobs=n_jobs)
     return problem, X, Y, out_dir, morris_config
 
 
-def run_morris_compare_strategies(config_path, strategies, out_dir=None):
+def run_morris_compare_strategies(config_path, strategies, out_dir=None, n_jobs=1):
     """Run the same Morris study (same sampled parameter trajectories,
     for a fair paired comparison) once per strategy, by overriding the
     base scenario's peer-group strategy field each time -- mirrors
     run_simulation.py's --compare-strategies. Requires the base scenario
     to have exactly one peer group (the "picker under test"), same
-    constraint as the single-strategy tool."""
+    constraint as the single-strategy tool. n_jobs parallelizes the
+    TRIALS within each strategy's run_trials_for_base call, not the
+    strategies themselves -- each strategy still runs one after another,
+    but its own trials run in parallel."""
     morris_config = MorrisConfig.from_yaml(config_path)
     base_dir = os.path.dirname(os.path.abspath(config_path))
     base_path = morris_config.base if os.path.isabs(morris_config.base) else os.path.join(base_dir, morris_config.base)
@@ -251,7 +286,7 @@ def run_morris_compare_strategies(config_path, strategies, out_dir=None):
     problem, X = generate_samples(morris_config)  # sampled once, reused for every strategy
     print(f"Morris comparison on '{base_name}': {len(problem['names'])} parameters, "
           f"{morris_config.trajectories} trajectories -> {len(X)} trials PER strategy "
-          f"({len(X) * len(strategies)} total), same sample reused across strategies")
+          f"({len(X) * len(strategies)} total), same sample reused across strategies, jobs={n_jobs}")
 
     all_results = {}
     for strategy in strategies:
@@ -259,7 +294,7 @@ def run_morris_compare_strategies(config_path, strategies, out_dir=None):
         strat_dict["agents"]["peers"][0]["strategy"] = strategy
         strat_dir = os.path.join(root, strategy)
 
-        Y = run_trials_for_base(strat_dict, problem, X, morris_config, strat_dir, label=strategy)
+        Y = run_trials_for_base(strat_dict, problem, X, morris_config, strat_dir, label=strategy, n_jobs=n_jobs)
         results = analyze_morris(problem, X, Y, strat_dir, num_levels=morris_config.levels)
         plot_morris(results, strat_dir)
         all_results[strategy] = results
@@ -383,12 +418,16 @@ if __name__ == "__main__":
                               "the same sampled parameter trajectories across all of them for a "
                               "fair comparison. Requires the base scenario to have exactly one "
                               "peer group.")
+    parser.add_argument("--jobs", type=int, default=1,
+                         help="Number of trials to run in parallel, via separate processes. "
+                              "With --compare-strategies, applies within each strategy's own "
+                              "trial batch (strategies still run one after another).")
     args = parser.parse_args()
 
     if args.compare_strategies:
-        run_morris_compare_strategies(args.config, args.compare_strategies, out_dir=args.out_dir)
+        run_morris_compare_strategies(args.config, args.compare_strategies, out_dir=args.out_dir, n_jobs=args.jobs)
     else:
-        problem, X, Y, out_dir, morris_config = run_morris_study(args.config, out_dir=args.out_dir)
+        problem, X, Y, out_dir, morris_config = run_morris_study(args.config, out_dir=args.out_dir, n_jobs=args.jobs)
         results = analyze_morris(problem, X, Y, out_dir, num_levels=morris_config.levels)
         plot_morris(results, out_dir)
         print(f"\nDone. See {out_dir}/morris_*.csv and {out_dir}/morris_plot.png")

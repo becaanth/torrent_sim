@@ -38,6 +38,47 @@ def run_one(config, output_dir, write_log=True):
     return torrent_sim.export_results(sim, all_agents, log_header, output_dir=output_dir, write_log=write_log)
 
 
+def _run_one_trial(spec):
+    """Top-level, picklable worker for ProcessPoolExecutor. spec is
+    (trial_index, config, output_dir, write_log); returns
+    (trial_index, metrics_rows). Must stay top-level (not a closure/
+    lambda) -- multiprocessing pickles the callable by reference."""
+    trial_index, config, output_dir, write_log = spec
+    rows = run_one(config, output_dir, write_log=write_log)
+    return trial_index, rows
+
+
+def run_trials_parallel(specs, n_jobs=1):
+    """Run a batch of independent trials, each spec a (trial_index,
+    config, output_dir, write_log) tuple, yielding (trial_index, rows)
+    as each completes (NOT necessarily in trial_index order -- callers
+    that need order, e.g. Morris's Y arrays, should index into a
+    pre-sized list/array by trial_index rather than relying on yield
+    order).
+
+    n_jobs<=1 runs sequentially in-process (no pool overhead). n_jobs>1
+    uses a ProcessPoolExecutor, deliberately NOT threads: every trial
+    seeds and draws from the global `random` module
+    (torrent_sim.build_simulation_from_config calls random.seed(...)
+    directly), and threads share that global state across trials --
+    concurrent threads would race on the same RNG stream and silently
+    corrupt each other's draws. Separate processes each get their own
+    fresh interpreter and `random` module state, so per-trial seeding
+    (each trial's config already carries its own resolved seed from
+    resolve_sweep/Morris sampling) stays correct with no extra work.
+    """
+    if n_jobs <= 1:
+        for spec in specs:
+            yield _run_one_trial(spec)
+        return
+
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        futures = [executor.submit(_run_one_trial, spec) for spec in specs]
+        for future in concurrent.futures.as_completed(futures):
+            yield future.result()
+
+
 def run_compare_strategies(path, strategies):
     """Load one base scenario and run it once per strategy in
     `strategies`, overriding only the peer group's strategy field --
@@ -108,7 +149,7 @@ def run_scenario(path):
           f"  python3 render_sim.py {log_path} --out {video_path}")
 
 
-def run_sweep(path):
+def run_sweep(path, n_jobs=1):
     from experiment_config import resolve_sweep
 
     sweep = SweepConfig.from_yaml(path)
@@ -127,13 +168,21 @@ def run_sweep(path):
 
     print(f"Running sweep over '{scenario_name}': {n_trials} trials "
           f"({len(sweep.grid)} grid axis(es) x {sweep.repeats} repeat(s)), "
-          f"varying {list(sweep.vary.keys())}, logs {'ON' if sweep.write_logs else 'off'}")
+          f"varying {list(sweep.vary.keys())}, logs {'ON' if sweep.write_logs else 'off'}, "
+          f"jobs={n_jobs}")
 
+    # overrides are looked up by trial_index at write time, since
+    # run_trials_parallel only carries (config, output_dir, write_log)
+    # across the process boundary -- the human-readable overrides dict
+    # stays in the parent process.
+    overrides_by_index = {trial_index: overrides for trial_index, _, overrides in trials}
+    specs = [(trial_index, config, os.path.join(sweep_root, f"trial_{trial_index:05d}"), sweep.write_logs)
+             for trial_index, config, _ in trials]
+
+    completed = 0
     with open(manifest_path, "w") as manifest_f:
-        for trial_index, config, overrides in trials:
-            trial_dir = os.path.join(sweep_root, f"trial_{trial_index:05d}")
-            rows = run_one(config, trial_dir, write_log=sweep.write_logs)
-
+        for trial_index, rows in run_trials_parallel(specs, n_jobs=n_jobs):
+            overrides = overrides_by_index[trial_index]
             manifest_f.write(json.dumps({"trial_index": trial_index, "overrides": overrides}) + "\n")
             for row in rows:
                 row = dict(row)
@@ -141,8 +190,9 @@ def run_sweep(path):
                 row.update(overrides)
                 summary_rows.append(row)
 
-            if (trial_index + 1) % max(1, n_trials // 20) == 0 or trial_index + 1 == n_trials:
-                print(f"  {trial_index + 1}/{n_trials} trials complete")
+            completed += 1
+            if completed % max(1, n_trials // 20) == 0 or completed == n_trials:
+                print(f"  {completed}/{n_trials} trials complete")
 
     if summary_rows:
         fieldnames = list(summary_rows[0].keys())
@@ -172,6 +222,10 @@ if __name__ == "__main__":
                               "overriding only the picker -- everything else in the scenario "
                               "stays identical. Requires the scenario to have exactly one "
                               "peer group.")
+    parser.add_argument("--jobs", type=int, default=1,
+                         help="Number of trials to run in parallel (sweep files only -- a "
+                              "single scenario run or --compare-strategies is just 1-3 runs, "
+                              "not worth pooling). Uses separate processes, not threads.")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -181,6 +235,6 @@ if __name__ == "__main__":
     if args.compare_strategies:
         run_compare_strategies(args.config, args.compare_strategies)
     elif is_sweep_file(args.config):
-        run_sweep(args.config)
+        run_sweep(args.config, n_jobs=args.jobs)
     else:
         run_scenario(args.config)
