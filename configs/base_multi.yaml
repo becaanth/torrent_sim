@@ -2,20 +2,16 @@ scenario:
   name: base_multi
   hypothesis: null
 
-simulation: {seed: 42, max_sim_time: 200.0, tick_interval: 2.0, move_interval: 1.5}
-topology: {directions: [N, NE, E, SE, S, SW, W, NW], horizon: 25}
-churn: {p_bad: 0.0}
-radio: {mode: fixed, fixed: {c_max: 10.0, d0: 50.0, gamma: 2.0}}
+simulation: {seed: 42, max_sim_time: 10000.0, piece_size_mb: 4.0, tick_interval: 2.0, move_interval: 2.0} 
+topology: {directions: [N, E, S, W], horizon: 500}
+churn: {p_bad: 0.0, mean_up: 15.0, mean_down: 5.0}
+radio: {mode: fixed, fixed: {c_max: 40.0, d0: 20.0, gamma: 2.0}}
 
 agents:
   seeders:
     - {direction: N}
-    - {direction: NE}
     - {direction: E}
-    - {direction: SE}
     - {direction: S}
-    - {direction: SW}
     - {direction: W}
-    - {direction: NW}
   peers:
-    - {count: 16, target: [N, NE, E, SE, S, SW, W, NW], strategy: rarest_random}
+    - {count: 16, target: [N, E,  S, W], strategy: rarest_random}

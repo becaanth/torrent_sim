@@ -1,14 +1,14 @@
 scenario:
-  name: base_convoy
+  name: s_minus
   hypothesis: null
 
 simulation: {seed: 42, max_sim_time: 10000.0, piece_size_mb: 4.0, tick_interval: 2.0, move_interval: 2.0} 
 topology: {directions: [E], horizon: 1000}
-churn: {p_bad: 0.0, mean_up: 15.0, mean_down: 5.0}
-radio: {mode: fixed, fixed: {c_max: 40.0, d0: 20.0, gamma: 2.0}}
+churn: {p_bad: 0.8, mean_up: 15.0, mean_down: 250.0}
+radio: {mode: fixed, fixed: {c_max: 40.0, d0: 800.0, gamma: 2.0}}
 
 agents:
   seeders:
     - {direction: E}
   peers:
-    - {count: 4, target: [E, E, E, E], strategy: rarest_random}
+    - {count: 40, target: [E, E, E, E], strategy: rarest_random}
