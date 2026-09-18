@@ -44,7 +44,7 @@ class SimulationConfig(BaseModel):
     max_sim_time: float = 500.0
     tick_interval: float = 2.0
     move_interval: float = 1.5
-
+    piece_size_mb: float = 1.0
 
 class TopologyConfig(BaseModel):
     directions: list[str] = Field(default_factory=lambda: ["N", "E", "S", "W"])

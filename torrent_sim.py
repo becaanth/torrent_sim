@@ -158,6 +158,8 @@ class TorrentSim:
 
             _, link_cap = self.compute_link_capacity(t.uploader, t.downloader)
 
+            # print("Uploader share, downloader shar, link_cap")
+            # print(uploader_share, downloader_share, link_cap)
             # bottleneck rate for this transfer
             t.current_rate_mbps = min(uploader_share, downloader_share, link_cap)
 
@@ -245,7 +247,7 @@ class TorrentSim:
                     return False
         return True
 
-    def start_churn(self, agent, p_bad, mean_down):
+    def start_churn(self, agent, p_bad, mean_down, start_delay=0.0):
         """Kick off randomized on/off churn for a every peer
         p_bad is this peers long-run fraction of time spent unavailable
         """
@@ -260,13 +262,11 @@ class TorrentSim:
         agent.churn_mean_down = mean_down
 
         if random.random() < p_bad:
-            agent.is_available = False
             self.log_event("CHURN_DEPART", agent_id=agent.agent_id)
-            down = random.expovariate(1.0 / mean_down)
-            self.schedule(down, "CHURN_REJOIN", agent, data=None)
+            self.schedule(start_delay, "CHURN_REJOIN", agent, data=None)
         else:
             up = random.expovariate(1.0 / mean_up)
-            self.schedule(up, "CHURN_DEPART", agent, data=None)
+            self.schedule(start_delay + up, "CHURN_DEPART", agent, data=None)
 
 
     def append_pieces(self, torrent_id, count, publisher_agent):
@@ -288,8 +288,8 @@ class TorrentSim:
                         x=publisher_agent.position[0], y=publisher_agent.position[1])
         self.log_event("APPEND", torrent_id=torrent_id, horizon=swarm.published_pieces)
 
-        print(f"[Time {self.time:6.2f}s] APPEND: Swarm '{torrent_id}' +{count} pieces added. "
-              f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
+        # print(f"[Time {self.time:6.2f}s] APPEND: Swarm '{torrent_id}' +{count} pieces added. "
+        #       f"New stream horizon: [0 .. {swarm.published_pieces - 1}]")
         
         # wake up idle leechers
         for agent in swarm.sorted_participants():
@@ -301,9 +301,9 @@ class TorrentSim:
         self.schedule(interval, "SEEDER_TICK", seeder_agent,
                       data=(torrent_id, interval, pieces_per_tick))
 
-    def start_walker(self, agent, torrent_id, interval):
+    def start_walker(self, agent, torrent_id, interval, start_delay=0.0):
         """Leechers walking clock (enabling repeats)"""
-        self.schedule(interval, "MOVE_TICK", agent, data=(torrent_id, interval))
+        self.schedule(start_delay, "MOVE_TICK", agent, data=(torrent_id, interval))
 
     def assign_cascade_chain(self, torrent_id, seeder_agent, rng=random):
         """IMO faithful cascading implementation - random connectivity chains at session start"""
@@ -340,6 +340,7 @@ class TorrentSim:
             self.time, _, event_type, agent, data = heapq.heappop(self.event_queue)
 
             if event_type == "PICK_PIECE":
+                # print("Pick piece event {}".format(data[0]))
                 torrent_id = data
                 agent.pick_next_piece(self, torrent_id)
 
@@ -351,7 +352,8 @@ class TorrentSim:
                 agent.is_available = False
                 self.log_event("CHURN_DEPART", agent_id=agent.agent_id)
                 # a dropped connection kills up/down
-                for t in list(agent.active_uploads) + list(agent.active_downloads):
+                for t in sorted(set(agent.active_uploads) | set(agent.active_downloads),
+                                 key=lambda tr: tr.transfer_id):
                     self.cancel_transfer(t, reason="churn")
                 if not self.all_work_done():
                     down = random.expovariate(1.0 / agent.churn_mean_down)
@@ -428,13 +430,13 @@ class TorrentSim:
 
 class Agent:
     """all agents in a swarm"""
-    def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10,
+    def __init__(self, agent_id, position=(0.0, 0.0),
             radio_c_max=10.0, radio_d0=10.0, radio_gamma=2.0            
         ):
         self.agent_id = agent_id
         self.position = position # (x,y)
-        self.download_speed = download_speed_mbps
-        self.upload_speed = upload_speed_mbps
+        self.download_speed = radio_c_max
+        self.upload_speed = radio_c_max
 
         # per-agent radio hardware
         self.radio_c_max = radio_c_max
@@ -446,6 +448,8 @@ class Agent:
         self.walk_step = 0
         self.walk_finish_time = None  # sim time physical navigation actually completed (None until then)
         self.wait_time = 0.0
+        self.spawn_stagger_offset = 0.0
+
         
         # which swarms this agent seeds
         self.seeded_torrents = set()
@@ -475,7 +479,7 @@ class Agent:
 
     def join_swarm(self, swarm, strategy="rarest_random", hybrid_s=0.5, segment_k=5, upstream_peer=None, is_seeder=False, is_target=False):
         t_id = swarm.torrent_id
-        swarm.sorted_participants().add(self)
+        swarm.participants.add(self)
 
         if is_seeder:
             self.completed_pieces[t_id] = set(range(swarm.published_pieces))
@@ -594,6 +598,10 @@ class Agent:
 
     def pick_next_piece(self, sim, torrent_id):
         if torrent_id not in self.completed_pieces:
+            return
+
+        # peer not active yet
+        if sim.time < self.spawn_stagger_offset:
             return
 
         # Guard: If agent is already actively downloading in this swarm, wait for that download to finish
@@ -746,7 +754,7 @@ def build_simulation_from_config(config):
             torrent_id=name,
             direction=DIRECTIONS[name],
             initial_pieces=1,
-            piece_size_mb=1,
+            piece_size_mb=config.simulation.piece_size_mb,
             max_pieces=config.topology.horizon_for(name),
         )
         sim.add_swarm(swarms[name])
@@ -779,9 +787,11 @@ def build_simulation_from_config(config):
     all_peers = []
     for group in config.agents.peers:
         target_cycle = itertools.cycle(group.target)  # round-robin, not random -- deterministic, even coverage
-        for _ in range(group.count):
+        for i in range(group.count):
             target_dir = next(target_cycle)
             peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides)
+            peer.spawn_stagger_offset = i * config.simulation.tick_interval
+
             for name in config.topology.directions:
                 peer.join_swarm(
                     swarms[name],
@@ -790,11 +800,13 @@ def build_simulation_from_config(config):
                     segment_k=group.segment_k,
                     is_target=(name == target_dir),
                 )
-            sim.start_walker(peer, target_dir, interval=config.simulation.move_interval)
+            sim.start_walker(peer, target_dir, interval=config.simulation.move_interval,
+                              start_delay=peer.spawn_stagger_offset)
 
             peer.is_bad = random.random() < config.churn.p_bad
             if peer.is_bad:
-                sim.start_churn(peer, config.churn.p_bad, config.churn.mean_down)
+                sim.start_churn(peer, config.churn.p_bad, config.churn.mean_down,
+                              start_delay=peer.spawn_stagger_offset)
 
             all_peers.append(peer)
 
@@ -808,38 +820,56 @@ def build_simulation_from_config(config):
     for agent in all_agents:
         for name in config.topology.directions:
             if name in agent.strategies:
-                sim.schedule(0.0, "PICK_PIECE", agent, data=name)
+                sim.schedule(agent.spawn_stagger_offset, "PICK_PIECE", agent, data=name)
 
     return sim, all_agents, log_header
 
 
 def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
-    """Write metrics.csv (always) and sim_log.json (if write_log) to
-    output_dir. Same per-session TRS + throughput-ceiling logic as the
-    __main__ demo, factored out so a runner script can call it once per
-    trial without duplicating it. Returns the metrics row list (e.g. for
-    a sweep runner to fold into a summary.csv across many trials)."""
     os.makedirs(output_dir, exist_ok=True)
 
+    # 1. Identify non-seed peers and compute fleet-wide totals
+    non_seed_peers = [a for a in all_agents if len(a.seeded_torrents) == 0]
+    n_peers_total = len(non_seed_peers)
+
+    fleet_total_pieces = sum(
+        sum(len(a.completed_pieces[tid]) for tid in a.completed_pieces)
+        for a in non_seed_peers
+    )
+    fleet_reachable_pieces = sum(
+        sum(a.contiguous_length(tid) for tid in a.completed_pieces)
+        for a in non_seed_peers
+    )
+    fleet_wait_time = sum(a.wait_time for a in non_seed_peers)
+
+    # Fleet-wide averages normalized by total peer count
+    avg_fleet_total_pieces = fleet_total_pieces / n_peers_total if n_peers_total > 0 else 0.0
+    avg_fleet_reachable_pieces = fleet_reachable_pieces / n_peers_total if n_peers_total > 0 else 0.0
+    avg_fleet_wait_time = fleet_wait_time / n_peers_total if n_peers_total > 0 else 0.0
+
+    # 2. Compute theoretical max throughput per swarm
     swarm_t_max = {}
     for t_id, swarm in sim.swarms.items():
         peers_in_swarm = [p for p in swarm.sorted_participants() if t_id not in p.seeded_torrents]
         seed_agents = [p for p in swarm.sorted_participants() if t_id in p.seeded_torrents]
-        n_peers = len(peers_in_swarm)
-        if n_peers == 0:
+        n_swarm = len(peers_in_swarm)
+        if n_swarm == 0:
             swarm_t_max[t_id] = None
             continue
         u_s = seed_agents[0].upload_speed if seed_agents else 0.0
-        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_peers
-        swarm_t_max[t_id] = (u_s + n_peers * u_p_avg) / n_peers
+        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_swarm
+        swarm_t_max[t_id] = (u_s + n_swarm * u_p_avg) / n_swarm
 
+    # 3. Build metric rows
     metrics_rows = []
     for agent in all_agents:
+        is_seed = len(agent.seeded_torrents) > 0
         for t_id in agent.strategies:
-            is_seed = t_id in agent.seeded_torrents
             role = "SEED" if is_seed else ("TARGET" if t_id == agent.target_torrent_id else "relay")
             session_complete = agent.finish_time.get(t_id) is not None
             t, s, r = (None, None, None) if (is_seed or not session_complete) else agent.get_metrics(sim, t_id)
+
+            peers_in_swarm = [p for p in sim.swarms[t_id].sorted_participants() if t_id not in p.seeded_torrents]
 
             metrics_rows.append({
                 "agent_id": agent.agent_id,
@@ -852,28 +882,24 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
                 "throughput_mbps": t,
                 "sequentiality": s,
                 "robustness": r,
-                "n_peers": None if is_seed else len(
-                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
+                "n_swarm_peers": len(peers_in_swarm),
+                "n_fleet_peers": n_peers_total,
                 "t_max_mbps": None if is_seed else swarm_t_max[t_id],
                 "start_time": agent.start_time[t_id],
                 "finish_time": agent.finish_time[t_id],
                 "walk_step": agent.walk_step if (not is_seed and t_id == agent.target_torrent_id) else None,
                 "walk_finish_time": agent.walk_finish_time if (not is_seed and t_id == agent.target_torrent_id) else None,
-                "total_pieces_held": (sum(len(agent.completed_pieces[tid]) for tid in agent.completed_pieces)
-                                      if (not is_seed and t_id == agent.target_torrent_id) else None),
-                "reachable_pieces_held": (sum(agent.contiguous_length(tid) for tid in agent.completed_pieces)
-                                          if (not is_seed and t_id == agent.target_torrent_id) else None),
-                "target_swarm_pieces_held": (len(agent.completed_pieces[agent.target_torrent_id])
-                                              if (not is_seed and t_id == agent.target_torrent_id) else None),
-                "target_swarm_reachable_pieces_held": (agent.contiguous_length(agent.target_torrent_id)
-                                                        if (not is_seed and t_id == agent.target_torrent_id) else None),
-                "wait_time": agent.wait_time/n_peers if (not is_seed and t_id == agent.target_torrent_id) else None,
+                # Raw per-agent metrics
+                "agent_total_pieces": sum(len(agent.completed_pieces[tid]) for tid in agent.completed_pieces) if not is_seed else None,
+                "agent_reachable_pieces": sum(agent.contiguous_length(tid) for tid in agent.completed_pieces) if not is_seed else None,
+                "agent_wait_time": agent.wait_time if not is_seed else None,
+                # Fleet-wide normalized averages
+                "fleet_avg_total_pieces": avg_fleet_total_pieces if not is_seed else None,
+                "fleet_avg_reachable_pieces": avg_fleet_reachable_pieces if not is_seed else None,
+                "fleet_avg_wait_time": avg_fleet_wait_time if not is_seed else None,
             })
 
-
-    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad", "session_complete",
-                  "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps",
-                  "start_time", "finish_time", "walk_step", "walk_finish_time", "total_pieces_held", "reachable_pieces_held", "target_swarm_pieces_held", "target_swarm_reachable_pieces_held", "wait_time"]
+    fieldnames = list(metrics_rows[0].keys()) if metrics_rows else []
     with open(os.path.join(output_dir, "metrics.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -884,8 +910,6 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
             json.dump({"header": log_header, "events": sim.log}, f)
 
     return metrics_rows
-
-
 
 if __name__=="__main__":
   # Multi-directional mapping scenario demo. (For the general,
@@ -969,8 +993,10 @@ if __name__=="__main__":
         peer_plan += [(d, STRATEGY)] * 4
 
     peers = []
-    for target_dir, strategy in peer_plan:
+    for i, (target_dir, strategy) in enumerate(peer_plan):
         peer = spawn_agent(use_random_radio=use_random_radio, position=(0.0, 0.0))
+        peer.spawn_stagger_offset = i * TICK_INTERVAL
+        
         for name in DIRECTIONS:
             # Every peer joins every swarm (full participation), but only
             # its target direction is marked is_target=True so that
@@ -980,10 +1006,9 @@ if __name__=="__main__":
                 strategy=strategy,
                 is_target=(name == target_dir),
             )
-        sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL)
-        peer.is_bad = random.random() < P_BAD
-        if peer.is_bad:
-            sim.start_churn(peer, P_BAD, CHURN_MEAN_DOWN)
+        sim.start_walker(peer, target_dir, interval=MOVE_INTERVAL, start_delay=peer.spawn_stagger_offset)
+        peer.is_bad = True
+        sim.start_churn(peer, P_BAD, CHURN_MEAN_DOWN, start_delay=peer.spawn_stagger_offset)
 
         peers.append(peer)
 
@@ -1000,7 +1025,7 @@ if __name__=="__main__":
     for agent in all_agents:
         for name in DIRECTIONS:
             if name in agent.strategies:
-                sim.schedule(0.0, "PICK_PIECE", agent, data=name)
+                sim.schedule(agent.spawn_stagger_offset, "PICK_PIECE", agent, data=name)
 
     print("=" * 90)
     print("MULTI-DIRECTIONAL MAPPING SIMULATION")
