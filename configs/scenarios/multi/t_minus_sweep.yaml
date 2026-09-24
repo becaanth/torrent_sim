@@ -1,0 +1,5 @@
+base: t_minus.yaml
+grid:
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 20   # repeat each (d0, strategy) point Nx with different seeds, to average out noise
+write_logs: true

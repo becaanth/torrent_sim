@@ -1,5 +1,5 @@
 scenario:
-  name: s_plus
+  name: s_plus_convoy
   hypothesis: null
 
 simulation: {seed: 42, max_sim_time: 10000.0, piece_size_mb: 4.0, tick_interval: 2.0, move_interval: 2.0} 
