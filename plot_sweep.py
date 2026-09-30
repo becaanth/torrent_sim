@@ -13,6 +13,7 @@ Usage:
 import argparse
 
 import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -58,8 +59,21 @@ def plot_sweep(summary_path, x, color="strategy", y_metrics=None, role="TARGET",
             # individual points (raw, so repeats/variance stay visible)...
             ax.scatter(sub[x], sub[y], color=colors[g], alpha=0.35, s=25, zorder=2)
             # ...and the mean per x-value, connected into a line.
-            means = sub.groupby(x)[y].mean().reset_index()
-            ax.plot(means[x], means[y], color=colors[g], marker="o", linewidth=2, label=str(g), zorder=3)
+            # means = sub.groupby(x)[y].mean().reset_index()
+            stats = sub.groupby(x)[y].agg(['mean', 'var']).reset_index()
+            plot_x = stats[x]
+            plot_mean = stats['mean']
+            plot_std = np.sqrt(stats['var']) 
+            ax.plot(plot_x, plot_mean, color=colors[g], lw=2, label=str(g))
+
+            # Fill the variance region (using standard deviation)
+            ax.fill_between(plot_x, 
+                            plot_mean - plot_std, 
+                            plot_mean + plot_std, 
+                            color=colors[g], 
+                            alpha=0.2)
+
+            # ax.plot(means[x], means[y], color=colors[g], marker="o", linewidth=2, label=str(g), zorder=3)
 
         ax.set_xlabel(x)
         ax.set_ylabel(Y_METRICS.get(y, y))

@@ -20,14 +20,16 @@ DIRECTIONS = {
     "NW": (-0.7071, 0.7071),
 }
 
-def random_radio_profile(rng=random, c_max_range=(6.0, 14.0),
-                          d0_range=(5.0, 15.0), gamma_range=(1.5, 3.0)):
+def random_radio_profile(rng=random, c_max_range=(35.0, 45.0),
+                          d0_range=(700.0, 800.0), gamma_range=(2.0, 2.5)):
     """sample a random radio"""
-    return {
+    profile = {
         "radio_c_max": rng.uniform(*c_max_range),
         "radio_d0": rng.uniform(*d0_range),
         "radio_gamma": rng.uniform(*gamma_range),
     }
+    print(f"profile {profile}")
+    return profile
 
 class Swarm:
     """Represents a single torrent session"""

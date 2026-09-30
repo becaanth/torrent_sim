@@ -1,0 +1,17 @@
+scenario:
+  name: random_radios_multi
+  hypothesis: null
+
+simulation: {seed: 42, max_sim_time: 100000.0, piece_size_mb: 4.0, tick_interval: 2.0, move_interval: 2.0} 
+topology: {directions: [N, E, S, W], horizon: 1000}
+churn: {p_bad: 0.2, mean_down: 1000.0}
+radio: {mode: random, random_ranges: {c_max: [10, 80], d0: [100.0, 800.0], gamma: [3.0, 3.5]}}
+
+agents:
+  seeders:
+    - {direction: N}
+    - {direction: E}
+    - {direction: S}
+    - {direction: W}
+  peers:
+    - {count: 64, target: [N, E, S, W], strategy: rarest_random}
