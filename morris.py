@@ -32,7 +32,7 @@ Study YAML:
       - finish_time
       - map_possession_fraction           # normalized [0,1]: avg per-agent own-path pieces held / horizon
       - reachable_map_possession_fraction # normalized [0,1]: avg per-agent own-path contiguous pieces / horizon
-      - wait_time                         # SUMMED across peers: total fleet-wide time spent stalled
+      - avg_wait_time                     # fleet-size-normalized: avg per-peer stalled time (see torrent_sim.export_results)
 
 Total trials = trajectories * (num_parameters + 1). Keep the base
 scenario cheap (small horizon/peer count) -- Morris needs many trials by
@@ -69,11 +69,15 @@ from run_simulation import run_one, run_trials_parallel
 # excluding it would bias exactly the parameter regions where things fail.
 CENSORED_AT_MAX_TIME = {"finish_time", "walk_finish_time"}
 
-# Metrics reported as a SUM across TARGET peers rather than a mean --
-# e.g. wait_time, where the question is "how much total fleet-time was
-# spent stalled," which should scale with fleet size, not be averaged
-# away by it. Everything else defaults to a per-agent mean.
-SUMMED_METRICS = {"wait_time"}
+# Metrics reported as a SUM across TARGET peers rather than a mean, for
+# the rare case where the question really is a fleet-wide total (e.g.
+# "how much cumulative peer-time was spent stalled," which scales with
+# fleet size on purpose). Empty by default: fleet-size normalization now
+# happens once, in torrent_sim.export_results (see its avg_* columns),
+# so the ordinary per-agent mean below is what most outputs want --
+# including "avg_wait_time", which is already a fleet-size-invariant
+# per-peer average and just needs passing through, not summing again.
+SUMMED_METRICS = set()
 
 
 class MorrisParameter(BaseModel):
@@ -94,7 +98,7 @@ class MorrisConfig(BaseModel):
     levels: int = 4
     role_filter: str = "TARGET"
     outputs: list[str] = Field(default_factory=lambda: [
-        "finish_time", "map_possession_fraction", "reachable_map_possession_fraction", "wait_time"])
+        "finish_time", "map_possession_fraction", "reachable_map_possession_fraction", "avg_wait_time"])
     write_logs: bool = False
 
     @classmethod
@@ -144,10 +148,14 @@ DERIVED_METRICS = {
 
 def reduce_trial(rows, outputs, role_filter, max_sim_time, topology_config=None):
     """Collapse one trial's full metrics.csv rows down to one scalar per
-    requested output metric: summed across every row matching
-    role_filter for outputs in SUMMED_METRICS (e.g. wait_time), averaged
-    otherwise (there may be several matching rows, e.g. multiple TARGET
-    peers).
+    requested output metric: averaged across every row matching
+    role_filter (there may be several matching rows, e.g. multiple
+    TARGET peers), or summed instead for any output listed in
+    SUMMED_METRICS (empty by default -- see its comment). Fleet-size
+    normalization itself (e.g. "avg_wait_time", "map_possession_fraction")
+    already happened once in torrent_sim.export_results, so this function
+    is not where that normalization is computed -- it is only collapsing
+    a trial's rows to a scalar for SALib.
 
     Outputs in DERIVED_METRICS are computed by first normalizing EACH
     row's raw value against that row's own swarm horizon (via
@@ -226,8 +234,8 @@ def run_trials_for_base(base_dict, problem, X, morris_config, out_dir, label="",
                                           "params": resolved_by_index[trial_index],
                                           "outputs": reduced}) + "\n")
             completed += 1
-            if completed % max(1, n_trials // 20) == 0 or completed == n_trials:
-                print(f"  {prefix}{completed}/{n_trials} trials complete")
+            pct = 100 * completed / n_trials
+            print(f"  {prefix}{completed}/{n_trials} trials complete ({pct:.0f}%)")
 
     np.save(os.path.join(out_dir, "X.npy"), X)
     with open(os.path.join(out_dir, "problem.json"), "w") as f:

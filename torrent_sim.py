@@ -1,7 +1,7 @@
 import heapq
 import random
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 import json
 import csv
 import os
@@ -11,7 +11,7 @@ import pdb
 
 DIRECTIONS = {
     "N":  (0.0, 1.0),
-    "NE": (0.7071, 0.7071),   # normalized -- must stay unit length
+    "NE": (0.7071, 0.7071),   # unit length
     "E":  (1.0, 0.0),
     "SE": (0.7071, -0.7071),
     "S":  (0.0, -1.0),
@@ -109,6 +109,7 @@ class TorrentSim:
                 "strategies": {tid: info["strategy"] for tid, info in a.strategies.items()},
                 "start_position": list(a.position),
                 "is_bad": a.is_bad,
+                "is_slow":a.is_slow
             })
             initial_pieces[a.agent_id] = {
                 tid: sorted(pieces) for tid, pieces in a.completed_pieces.items()
@@ -432,13 +433,13 @@ class TorrentSim:
 
 class Agent:
     """all agents in a swarm"""
-    def __init__(self, agent_id, position=(0.0, 0.0),
+    def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10,
             radio_c_max=10.0, radio_d0=10.0, radio_gamma=2.0            
         ):
         self.agent_id = agent_id
         self.position = position # (x,y)
-        self.download_speed = radio_c_max
-        self.upload_speed = radio_c_max
+        self.download_speed = download_speed_mbps
+        self.upload_speed = upload_speed_mbps
 
         # per-agent radio hardware
         self.radio_c_max = radio_c_max
@@ -461,6 +462,9 @@ class Agent:
         self.is_available = True
         self.churn_mean_up = None
         self.churn_mean_down = None
+
+        # heterogeneity
+        self.is_slow = False
 
         # continuous time tracking sets
         self.active_uploads = set()
@@ -764,7 +768,7 @@ def build_simulation_from_config(config):
     all_agents = []
     next_agent_id = [0]
 
-    def spawn_agent(radio_overrides=None, **kwargs):
+    def spawn_agent(radio_overrides=None, degrade=False, **kwargs):
         if config.radio.mode == "random":
             rr = config.radio.random_ranges
             profile = random_radio_profile(c_max_range=rr.c_max, d0_range=rr.d0, gamma_range=rr.gamma)
@@ -773,7 +777,16 @@ def build_simulation_from_config(config):
             profile = {"radio_c_max": f.c_max, "radio_d0": f.d0, "radio_gamma": f.gamma}
         for key, value in (radio_overrides or {}).items():
             profile[f"radio_{key}"] = value
+
+        is_slow = False
+        if degrade and config.heterogeneity.p_slow > 0.0 and random.random() < config.heterogeneity.p_slow:
+            is_slow = True
+            profile["radio_c_max"] = profile["radio_c_max"] * config.heterogeneity.slow_factor
+
+        profile["download_speed_mbps"] = profile["radio_c_max"]
+        profile["upload_speed_mbps"] = profile["radio_c_max"]
         agent = Agent(agent_id=next_agent_id[0], **profile, **kwargs)
+        agent.is_slow = is_slow
         next_agent_id[0] += 1
         all_agents.append(agent)
         return agent
@@ -791,7 +804,7 @@ def build_simulation_from_config(config):
         target_cycle = itertools.cycle(group.target)  # round-robin, not random -- deterministic, even coverage
         for i in range(group.count):
             target_dir = next(target_cycle)
-            peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides)
+            peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides, degrade=True)
             peer.spawn_stagger_offset = i * config.simulation.tick_interval
 
             for name in config.topology.directions:
@@ -805,7 +818,7 @@ def build_simulation_from_config(config):
             sim.start_walker(peer, target_dir, interval=config.simulation.move_interval,
                               start_delay=peer.spawn_stagger_offset)
 
-            peer.is_bad = random.random() < config.churn.p_bad
+            peer.is_bad = True # everyone churns
             if peer.is_bad:
                 sim.start_churn(peer, config.churn.p_bad, config.churn.mean_down,
                               start_delay=peer.spawn_stagger_offset)
@@ -828,39 +841,20 @@ def build_simulation_from_config(config):
 
 
 def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
+    """write metrics.csv and sim_log.json"""
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Identify non-seed peers and compute fleet-wide totals
-    non_seed_peers = [a for a in all_agents if len(a.seeded_torrents) == 0]
-    n_peers_total = len(non_seed_peers)
-
-    fleet_total_pieces = sum(
-        sum(len(a.completed_pieces[tid]) for tid in a.completed_pieces)
-        for a in non_seed_peers
-    )
-    fleet_reachable_pieces = sum(
-        sum(a.contiguous_length(tid) for tid in a.completed_pieces)
-        for a in non_seed_peers
-    )
-    fleet_wait_time = sum(a.wait_time for a in non_seed_peers)
-
-    # Fleet-wide averages normalized by total peer count
-    avg_fleet_total_pieces = fleet_total_pieces / n_peers_total if n_peers_total > 0 else 0.0
-    avg_fleet_reachable_pieces = fleet_reachable_pieces / n_peers_total if n_peers_total > 0 else 0.0
-    avg_fleet_wait_time = fleet_wait_time / n_peers_total if n_peers_total > 0 else 0.0
-
-    # 2. Compute theoretical max throughput per swarm
     swarm_t_max = {}
     for t_id, swarm in sim.swarms.items():
         peers_in_swarm = [p for p in swarm.sorted_participants() if t_id not in p.seeded_torrents]
         seed_agents = [p for p in swarm.sorted_participants() if t_id in p.seeded_torrents]
-        n_swarm = len(peers_in_swarm)
-        if n_swarm == 0:
+        n_peers = len(peers_in_swarm)
+        if n_peers == 0:
             swarm_t_max[t_id] = None
             continue
         u_s = seed_agents[0].upload_speed if seed_agents else 0.0
-        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_swarm
-        swarm_t_max[t_id] = (u_s + n_swarm * u_p_avg) / n_swarm
+        u_p_avg = sum(p.upload_speed for p in peers_in_swarm) / n_peers
+        swarm_t_max[t_id] = (u_s + n_peers * u_p_avg) / n_peers
 
     # 3. Build metric rows
     metrics_rows = []
@@ -871,8 +865,6 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
             session_complete = agent.finish_time.get(t_id) is not None
             t, s, r = (None, None, None) if (is_seed or not session_complete) else agent.get_metrics(sim, t_id)
 
-            peers_in_swarm = [p for p in sim.swarms[t_id].sorted_participants() if t_id not in p.seeded_torrents]
-
             metrics_rows.append({
                 "agent_id": agent.agent_id,
                 "torrent_id": t_id,
@@ -881,27 +873,62 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
                 "role": role,
                 "strategy": "(source)" if is_seed else agent.strategies[t_id]["strategy"],
                 "is_bad": agent.is_bad,
+                "is_slow": agent.is_slow,
                 "throughput_mbps": t,
                 "sequentiality": s,
                 "robustness": r,
-                "n_swarm_peers": len(peers_in_swarm),
-                "n_fleet_peers": n_peers_total,
+                "n_peers": None if is_seed else len(
+                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
                 "t_max_mbps": None if is_seed else swarm_t_max[t_id],
                 "start_time": agent.start_time[t_id],
                 "finish_time": agent.finish_time[t_id],
                 "walk_step": agent.walk_step if (not is_seed and t_id == agent.target_torrent_id) else None,
                 "walk_finish_time": agent.walk_finish_time if (not is_seed and t_id == agent.target_torrent_id) else None,
-                # Raw per-agent metrics
-                "agent_total_pieces": sum(len(agent.completed_pieces[tid]) for tid in agent.completed_pieces) if not is_seed else None,
-                "agent_reachable_pieces": sum(agent.contiguous_length(tid) for tid in agent.completed_pieces) if not is_seed else None,
-                "agent_wait_time": agent.wait_time if not is_seed else None,
-                # Fleet-wide normalized averages
-                "fleet_avg_total_pieces": avg_fleet_total_pieces if not is_seed else None,
-                "fleet_avg_reachable_pieces": avg_fleet_reachable_pieces if not is_seed else None,
-                "fleet_avg_wait_time": avg_fleet_wait_time if not is_seed else None,
+                "total_pieces_held": (sum(len(agent.completed_pieces[tid]) for tid in agent.completed_pieces)
+                                      if (not is_seed and t_id == agent.target_torrent_id) else None),
+                "reachable_pieces_held": (sum(agent.contiguous_length(tid) for tid in agent.completed_pieces)
+                                          if (not is_seed and t_id == agent.target_torrent_id) else None),
+                "target_swarm_pieces_held": (len(agent.completed_pieces[agent.target_torrent_id])
+                                              if (not is_seed and t_id == agent.target_torrent_id) else None),
+                "target_swarm_reachable_pieces_held": (agent.contiguous_length(agent.target_torrent_id)
+                                                        if (not is_seed and t_id == agent.target_torrent_id) else None),
+                "wait_time": agent.wait_time if (not is_seed and t_id == agent.target_torrent_id) else None,
+                # Filled in by the cross-row aggregation pass below.
+                "avg_total_pieces_held": None,
+                "avg_reachable_pieces_held": None,
+                "avg_target_swarm_pieces_held": None,
+                "avg_target_swarm_reachable_pieces_held": None,
+                "avg_wait_time": None,
+                "n_target_peers": None,
             })
 
-    fieldnames = list(metrics_rows[0].keys()) if metrics_rows else []
+    NORM_FIELDS = ["total_pieces_held", "reachable_pieces_held",
+                   "target_swarm_pieces_held", "target_swarm_reachable_pieces_held",
+                   "wait_time"]
+    by_target_swarm = defaultdict(list)
+    for row in metrics_rows:
+        if row["role"] == "TARGET":
+            by_target_swarm[row["target_torrent_id"]].append(row)
+
+    for t_id, rows in by_target_swarm.items():
+        n = len(rows)
+        avgs = {f: sum(row[f] for row in rows) / n for f in NORM_FIELDS}
+        for row in rows:
+            row["avg_total_pieces_held"] = avgs["total_pieces_held"]
+            row["avg_reachable_pieces_held"] = avgs["reachable_pieces_held"]
+            row["avg_target_swarm_pieces_held"] = avgs["target_swarm_pieces_held"]
+            row["avg_target_swarm_reachable_pieces_held"] = avgs["target_swarm_reachable_pieces_held"]
+            row["avg_wait_time"] = avgs["wait_time"]
+            row["n_target_peers"] = n
+
+    fieldnames = ["agent_id", "torrent_id", "target_torrent_id", "role", "strategy", "is_bad", "is_slow", "session_complete",
+                  "throughput_mbps", "sequentiality", "robustness", "n_peers", "t_max_mbps",
+                  "start_time", "finish_time", "walk_step", "walk_finish_time",
+                  "total_pieces_held", "reachable_pieces_held",
+                  "target_swarm_pieces_held", "target_swarm_reachable_pieces_held", "wait_time",
+                  "avg_total_pieces_held", "avg_reachable_pieces_held",
+                  "avg_target_swarm_pieces_held", "avg_target_swarm_reachable_pieces_held",
+                  "avg_wait_time", "n_target_peers"]
     with open(os.path.join(output_dir, "metrics.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -913,19 +940,10 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
 
     return metrics_rows
 
+
+
 if __name__=="__main__":
-  # Multi-directional mapping scenario demo. (For the general,
-    # YAML-driven version of this same setup, see
-    # build_simulation_from_config()/export_results() above -- this
-    # block is a quick hardcoded smoke-test/demo entry point.)
-    #
-    # NOTE: this used to be accidentally duplicated twice inline in this
-    # file (the whole setup+run+export, not just the export portion) --
-    # that's exactly how the incomplete-session export fix ended up
-    # applied inconsistently across copies, since any fix had to be
-    # manually repeated in each copy and it was easy to miss one.
-    # Collapsed back down to a single run that calls the shared
-    # export_results() function.
+  # Multi-directional mapping scenario demo. 
     random.seed(42)  # reproducible heterogeneous radio spawns
     STRATEGY = "rarest_random"
 
@@ -940,6 +958,9 @@ if __name__=="__main__":
     CHURN_MEAN_UP = 15.0       # mean seconds a bad peer stays available before dropping
     CHURN_MEAN_DOWN = 5.0      # mean seconds a bad peer stays gone before rejoining
     sim.p_bad = P_BAD          # read by get_metrics() for the reported robustness score
+
+    P_SLOW = 0.0               # fraction of peers with a permanently degraded radio (capacity, not churn)
+    SLOW_FACTOR = 0.5          # degraded peers' radio_c_max is multiplied by this
 
     # --- Build one swarm per direction ---
     swarms = {}
@@ -957,7 +978,7 @@ if __name__=="__main__":
     next_agent_id = 0
     use_random_radio = False
 
-    def spawn_agent(use_random_radio=True, **kwargs):
+    def spawn_agent(use_random_radio=True, degrade=False, **kwargs):
         """Helper: assign the next agent_id and either a randomized radio profile
         or default Agent radio parameters unless overridden."""
         global next_agent_id
@@ -974,7 +995,15 @@ if __name__=="__main__":
 
         profile.update(radio_overrides)
 
+        is_slow = False
+        if degrade and P_SLOW > 0.0 and random.random() < P_SLOW:
+            is_slow = True
+            profile["radio_c_max"] = profile["radio_c_max"] * SLOW_FACTOR
+
+        profile["download_speed_mbps"] = profile["radio_c_max"]
+        profile["upload_speed_mbps"] = profile["radio_c_max"]
         agent = Agent(agent_id=next_agent_id, **profile, **kwargs)
+        agent.is_slow = is_slow
         next_agent_id += 1
         all_agents.append(agent)
         return agent

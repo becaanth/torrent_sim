@@ -15,10 +15,6 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 KNOWN_STRATEGIES = {"rarest_random", "sequential", "cascading", "hybrid", "segment_random"}
-
-# Kept in sync with torrent_sim.DIRECTIONS by name (not imported directly,
-# so this module has no hard dependency on torrent_sim.py -- validation
-# here only needs to know which names are legal, not their vectors).
 ALL_DIRECTIONS = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"}
 
 
@@ -74,6 +70,20 @@ class ChurnConfig(BaseModel):
     def _check_p(self):
         if not (0.0 <= self.p_bad <= 1.0):
             raise ValueError(f"churn.p_bad must be within [0, 1], got {self.p_bad}")
+        return self
+
+class HeterogeneityConfig(BaseModel):
+    # degrade some peers radios by some factor
+    p_slow: float = 0.0 # p(a peer is selected to be degraded)
+    slow_factor: float = 0.5 # degradation factor
+    
+    @model_validator(mode="after")
+    def _check(self):
+        if not (0.0 <= self.p_slow <= 1.0):
+            raise ValueError(f"heterogeneity.p_slow must be within [0, 1] -- got {self.p_slow}")
+        if not (0.0 < self.slow_factor <= 1.0):
+            raise ValueError(f"heterogeneity.slow_factor must be within (0, 1] -- got {self.slow_factor} "
+                              f"(it multiplies radio_c_max, so >1 would mean 'slow' peers are faster)")
         return self
 
 
@@ -145,6 +155,7 @@ class ScenarioConfig(BaseModel):
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     topology: TopologyConfig = Field(default_factory=TopologyConfig)
     churn: ChurnConfig = Field(default_factory=ChurnConfig)
+    heterogeneity: HeterogeneityConfig = Field(default_factory=HeterogeneityConfig)
     radio: RadioConfig = Field(default_factory=RadioConfig)
     agents: AgentsConfig
 
