@@ -192,6 +192,11 @@ class TorrentSim:
                         torrent_id=torrent_id, piece_id=piece_id,
                         downloader_id=downloader.agent_id, uploader_id=uploader.agent_id)
 
+        if self.transfer_timeout is not None:
+            strategy = downloader.strategies[torrent_id]["strategy"]
+            if strategy != "cascading":
+                self.schedule(self.transfer_timeout, "TRANSFER_TIMEOUT", downloader, data=transfer)
+
         self.recalculate_bandwidth()
 
     def finish_transfer(self, transfer):
@@ -431,6 +436,16 @@ class TorrentSim:
                     else:
                         self.schedule(0.0, "PICK_PIECE", agent, data=t_id)
 
+            elif event_type == "TRANSFER_TIMEOUT":
+                transfer = data
+                # filter stale events: transfer already finished/cancelled
+                # by the time this fires, nothing to do
+                if transfer in self.active_transfers:
+                    self.log_event("TRANSFER_TIMEOUT", transfer_id=transfer.transfer_id,
+                                    agent_id=agent.agent_id)
+                    self.cancel_transfer(transfer, reason="timeout")
+
+
 class Agent:
     """all agents in a swarm"""
     def __init__(self, agent_id, position=(0.0, 0.0), download_speed_mbps=10, upload_speed_mbps=10,
@@ -445,6 +460,8 @@ class Agent:
         self.radio_c_max = radio_c_max
         self.radio_d0 = radio_d0
         self.radio_gamma = radio_gamma
+
+        self.transfer_timeout = None
 
         # repeat we are executing
         self.target_torrent_id = None
@@ -753,6 +770,7 @@ def build_simulation_from_config(config):
 
     sim = TorrentSim()
     sim.p_bad = config.churn.p_bad
+    sim.transfer_timeout = config.simulation.transfer_timeout
 
     swarms = {}
     for name in config.topology.directions:
@@ -768,7 +786,7 @@ def build_simulation_from_config(config):
     all_agents = []
     next_agent_id = [0]
 
-    def spawn_agent(radio_overrides=None, degrade=False, **kwargs):
+    def spawn_agent(radio_overrides=None, degrade=False, force_slow=None, **kwargs):
         if config.radio.mode == "random":
             rr = config.radio.random_ranges
             profile = random_radio_profile(c_max_range=rr.c_max, d0_range=rr.d0, gamma_range=rr.gamma)
@@ -779,9 +797,13 @@ def build_simulation_from_config(config):
             profile[f"radio_{key}"] = value
 
         is_slow = False
-        if degrade and config.heterogeneity.p_slow > 0.0 and random.random() < config.heterogeneity.p_slow:
-            is_slow = True
-            profile["radio_c_max"] = profile["radio_c_max"] * config.heterogeneity.slow_factor
+        if degrade:
+            if force_slow is not None:
+                is_slow = force_slow
+            else:
+                is_slow = (config.heterogeneity.p_slow > 0.0 and random.random() < config.heterogeneity.p_slow)
+        if is_slow:
+            profile["radio_c_max"] = profile["radio_c_max"] * (1 - config.heterogeneity.slow_factor) # degrade by slow_factor
 
         profile["download_speed_mbps"] = profile["radio_c_max"]
         profile["upload_speed_mbps"] = profile["radio_c_max"]
@@ -799,13 +821,20 @@ def build_simulation_from_config(config):
         seeders[name] = seeder
         sim.start_seeder(seeder, name, interval=config.simulation.tick_interval)
 
+    # if heterogeneity mode is n_slow, pick exactly n slow peer indices
+    total_peer_count = sum(group.count for group in config.agents.peers)
+    n_slow = min(config.heterogeneity.n_slow, total_peer_count) if config.heterogeneity.mode == "n_slow" else None
+
     all_peers = []
+    peer_index = 0
     for group in config.agents.peers:
         target_cycle = itertools.cycle(group.target)  # round-robin, not random -- deterministic, even coverage
         for i in range(group.count):
             target_dir = next(target_cycle)
-            peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides, degrade=True)
+            force_slow = (peer_index < n_slow) if n_slow is not None else None
+            peer = spawn_agent(position=(0.0, 0.0), radio_overrides=group.radio_overrides, degrade=True, force_slow=force_slow)
             peer.spawn_stagger_offset = i * config.simulation.tick_interval
+            peer_index += 1
 
             for name in config.topology.directions:
                 peer.join_swarm(

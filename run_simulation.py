@@ -160,7 +160,8 @@ def run_sweep(path, n_jobs=1):
     scenario_name = ScenarioConfig.from_yaml(
         sweep.base if os.path.isabs(sweep.base) else os.path.join(base_dir, sweep.base)
     ).scenario.name
-    sweep_root = os.path.join("results", scenario_name)
+    sweep_name = os.path.splitext(os.path.basename(path))[0]
+    sweep_root = os.path.join("results", f"{sweep_name}_{scenario_name}")
     os.makedirs(sweep_root, exist_ok=True)
 
     manifest_path = os.path.join(sweep_root, "manifest.jsonl")
@@ -226,6 +227,7 @@ if __name__ == "__main__":
                          help="Number of trials to run in parallel (sweep files only -- a "
                               "single scenario run or --compare-strategies is just 1-3 runs, "
                               "not worth pooling). Uses separate processes, not threads.")
+    parser.add_argument("--out-dir", default="results")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):

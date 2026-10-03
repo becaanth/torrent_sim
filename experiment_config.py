@@ -41,6 +41,7 @@ class SimulationConfig(BaseModel):
     tick_interval: float = 2.0
     move_interval: float = 1.5
     piece_size_mb: float = 1.0
+    transfer_timeout: Optional[float] = None
 
 class TopologyConfig(BaseModel):
     directions: list[str] = Field(default_factory=lambda: ["N", "E", "S", "W"])
@@ -74,16 +75,21 @@ class ChurnConfig(BaseModel):
 
 class HeterogeneityConfig(BaseModel):
     # degrade some peers radios by some factor
+    mode: Literal["p_slow", "n_slow"] = "p_slow"
     p_slow: float = 0.0 # p(a peer is selected to be degraded)
+    n_slow: int = 0
     slow_factor: float = 0.5 # degradation factor
     
     @model_validator(mode="after")
     def _check(self):
         if not (0.0 <= self.p_slow <= 1.0):
             raise ValueError(f"heterogeneity.p_slow must be within [0, 1] -- got {self.p_slow}")
+        if self.n_slow < 0:
+            raise ValueError(f"heterogeneity.n_slow must be >= 0 -- got {self.n_slow}")
         if not (0.0 < self.slow_factor <= 1.0):
             raise ValueError(f"heterogeneity.slow_factor must be within (0, 1] -- got {self.slow_factor} "
-                              f"(it multiplies radio_c_max, so >1 would mean 'slow' peers are faster)")
+                              f"(it's subtracted as a fraction of radio_c_max, so >1 would degrade "
+                              f"below zero capacity)")
         return self
 
 
