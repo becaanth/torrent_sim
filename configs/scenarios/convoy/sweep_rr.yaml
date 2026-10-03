@@ -1,0 +1,6 @@
+base: base_convoy.yaml
+grid:
+  radio.fixed.d0: [100.0, 250.0, 400.0, 650.0, 800.0]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 20   # repeat each point with different seeds, to average out noise
+write_logs: true

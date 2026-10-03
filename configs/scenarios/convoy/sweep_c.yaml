@@ -1,0 +1,8 @@
+base: base_convoy.yaml
+grid:
+  heterogeneity.slow_factor: [0.01, 0.5, 0.75, 0.99]
+  # heterogeneity.slow_factor: [0.01, 0.99]
+  # heterogeneity.n_slow: [1, 2]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 20   # repeat each point with different seeds, to average out noise
+write_logs: true

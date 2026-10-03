@@ -1,0 +1,6 @@
+base: base_convoy.yaml
+grid:
+  agents.peers.0.count: [2,3,4,5, 10, 25, 40, 60]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 20   # repeat each point with different seeds, to average out noise
+write_logs: true
