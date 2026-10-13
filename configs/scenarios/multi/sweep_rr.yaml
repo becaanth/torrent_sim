@@ -1,0 +1,7 @@
+base: base_multi.yaml
+grid:
+  # radio.fixed.d0: [100.0, 500.0, 1000.0, 1500.0, 2000.0, 4000.0]
+  radio.fixed.d0: [100.0, 200.0, 300.0, 400.0, 500.0, 1000.0, 2000.0, 4000.0]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 6   # repeat each point with different seeds, to average out noise
+write_logs: true

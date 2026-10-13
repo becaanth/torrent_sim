@@ -1,0 +1,6 @@
+base: base_multi.yaml
+grid:
+  agents.peers.0.count: [2, 5, 10, 12, 15, 18, 20, 40]
+  agents.peers.0.strategy: [rarest_random, sequential, cascading]
+repeats: 6   # repeat each point with different seeds, to average out noise
+write_logs: true
