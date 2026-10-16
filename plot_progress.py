@@ -380,8 +380,8 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
         ax.set_ylim(-0.04 * ymax, 1.06 * ymax)
         ax.set_yticks([t for t in ax.get_yticks() if 0 <= t <= ymax * 1.0001])
         ax.grid(alpha=0.25)
-        ax.set_xlabel("time (s)")
-    axes[0].set_ylabel("# maps held (mean healthy peer, target swarm)")
+        ax.set_xlabel("Time (s)")
+    axes[0].set_ylabel("Number of Maps Held")
     if facet:
         for cv, ax in ax_for.items():
             ax.set_title(str(cv), fontsize=10)
@@ -399,9 +399,13 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
                                                    f"\n(light = low, dark = high)")]
     host = axes[-1]
     leg1 = host.legend(handles=pol, title=color_by, fontsize=8, title_fontsize=8,
-                       loc="upper left", bbox_to_anchor=(1.12, 1.0), frameon=False)
-    host.add_artist(leg1)
-    host.legend(handles=lines, fontsize=8, loc="lower left", bbox_to_anchor=(1.12, 0.0), frameon=False)
+                       loc="upper center", bbox_to_anchor=(1.12, 1.0), frameon=False)
+    keys = {'heterogeneity.slow_factor':'Radio Degradation Factor (%)',
+            'agents.peers.0.count':'Number of Peers',
+            'radio.fixed.d0':'Radio Strength (distance at which link rate is halved)'}
+    ax.set_title(f'Sweep over {keys.get(tint_by)}')
+    # host.add_artist(leg1)
+    # host.legend(handles=lines, fontsize=8, loc="lower left", bbox_to_anchor=(1.12, 0.0), frameon=False)
 
     fig.subplots_adjust(left=0.07, right=0.80 if not facet else 0.84, bottom=0.12, top=0.92)
     for ax in axes:
