@@ -18,7 +18,14 @@ Encoding:
                  heterogeneity sweeps show how the healthy fleet fares, not
                  the degraded radio itself. With no slow peers it is simply
                  the mean over all peers. Averaged over repeats.
-  black dashed = seeder
+  dashed colour line = (multi-swarm runs) the peers' OTHER swarms, same colour as the solid
+                 target-swarm line, one dashed line per other swarm, unlabelled
+  shaded band  = (--spread repeats|peers) min-max behind each solid line:
+                 repeats = min/max of the per-trial mean peer across repeats
+                           (seed noise);
+                 peers   = min/max over individual healthy peers, pooled over
+                           all repeats (what the mean hides).
+  thick black  = seeder (drawn beneath the traces so a trace lying on it stays visible)
 
 Needs the sweep to have been run with `write_logs: true` (reads
 {sweep_dir}/trial_XXXXX/sim_log.json plus {sweep_dir}/manifest.jsonl).
@@ -44,10 +51,17 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 # Same policy hues as metrics_plots.py so figures stay consistent.
+# STRATEGY_COLORS = {
+#     "rarest_random": "#ff7f0e",
+#     "sequential": "#2ca02c",
+#     "cascading": "#1f77b4",
+#     "hybrid": "#9467bd",
+#     "segment_random": "#d62728",
+# }
 STRATEGY_COLORS = {
-    "rarest_random": "#ff7f0e",
+    "rarest_random": "#1f77b4",
     "sequential": "#2ca02c",
-    "cascading": "#1f77b4",
+    "cascading": "#d62728",
     "hybrid": "#9467bd",
     "segment_random": "#d62728",
 }
@@ -93,21 +107,17 @@ def agent_curve(initial_pieces, owned):
     return np.array(times), np.array(maps, dtype=float), np.array(reach, dtype=float)
 
 
-def cascade_chain(header, events, seeder_id, peer_ids):
-    """Upstream-to-downstream agent order of a cascading swarm, rebuilt from who
+def cascade_chain(header, links, seeder_id, peer_ids, torrent_id):
+    """Upstream-to-downstream agent order of ONE swarm's cascade, rebuilt from who
     actually uploaded to whom (a cascading peer only ever downloads from its one
-    upstream). None if the peers aren't all cascading or the links don't form a
-    single chain."""
-    strat = {a["id"]: set(a["strategies"].values()) for a in header["agents"]}
-    if any(strat[p] != {"cascading"} for p in peer_ids):
+    upstream). `links` = {uploader_id: {downloader_ids}} for that swarm. None if
+    the peers aren't all cascading in it or the links don't form a single chain."""
+    strat = {a["id"]: a["strategies"].get(torrent_id) for a in header["agents"]}
+    if not peer_ids or any(strat[p] != "cascading" for p in peer_ids):
         return None
-    nxt = {}
-    for e in events:
-        if e["type"] == "TRANSFER_START":
-            nxt.setdefault(e["uploader_id"], set()).add(e["downloader_id"])
     chain, cur = [], seeder_id
-    while cur in nxt and len(nxt[cur]) == 1:
-        cur = next(iter(nxt[cur]))
+    while cur in links and len(links[cur]) == 1:
+        cur = next(iter(links[cur]))
         chain.append(cur)
     return chain if sorted(chain) == sorted(peer_ids) else None
 
@@ -123,27 +133,36 @@ def load_trial_curves(log_path):
     initial = {int(k): v for k, v in header["initial_pieces"].items()}
 
     owned = defaultdict(list)
+    links = defaultdict(lambda: defaultdict(set))     # swarm -> uploader -> {downloaders}
     t_end = 0.0
     for e in events:
-        if e["type"] == "PIECE_OWNED":
+        if e["type"] == "TRANSFER_START":
+            links[e["torrent_id"]][e["uploader_id"]].add(e["downloader_id"])
+        elif e["type"] == "PIECE_OWNED":
             aid = e["agent_id"]
-            if e["torrent_id"] == target[aid]:
-                owned[aid].append((e["t"], e["piece_id"]))
+            owned[(aid, e["torrent_id"])].append((e["t"], e["piece_id"]))
             t_end = max(t_end, e["t"])
 
-    seeders, peers, seeder_ids = [], [], []
+    strategies = {a["id"]: a["strategies"] for a in header["agents"]}
+    seeders, peers = {}, []          # seeders: swarm -> (agent id, curve)
     for aid in target:
         tid = target[aid]
-        curve = agent_curve(initial[aid].get(tid, []), owned[aid])
         if tid in seeded[aid]:
-            seeders.append(curve)
-            seeder_ids.append(aid)
+            seeders[tid] = (aid, agent_curve(initial[aid].get(tid, []), owned[(aid, tid)]))
         else:
-            peers.append((*curve, is_slow[aid], aid))
+            curve = agent_curve(initial[aid].get(tid, []), owned[(aid, tid)])
+            # the peer's other swarms (it relays them); {} in a single-swarm run
+            others = {o: agent_curve(initial[aid].get(o, []), owned[(aid, o)])
+                      for o in strategies[aid] if o != tid and o not in seeded[aid]}
+            peers.append((*curve, is_slow[aid], aid, others, tid))
     if not seeders or not peers:
         raise ValueError(f"{log_path}: need at least one seeder and one peer")
-    return {"seeder": seeders[0], "peers": peers, "t_end": t_end,
-            "chain": cascade_chain(header, events, seeder_ids[0], [p[4] for p in peers])}
+    ptid = peers[0][6]               # the swarm the peers are travelling in
+    if ptid not in seeders:
+        raise ValueError(f"{log_path}: no seeder for the peers' target swarm '{ptid}'")
+    chains = {tid: cascade_chain(header, links[tid], sid, [p[4] for p in peers if tid in strategies[p[4]]], tid)
+              for tid, (sid, _) in seeders.items()}
+    return {"seeder": seeders[ptid][1], "peers": peers, "t_end": t_end, "chains": chains}
 
 
 def hold(times, vals, grid):
@@ -269,8 +288,18 @@ def place_labels(fig, ax, labels, grid, ymax, min_sep=0.03):
             ax.text(cx, cy, lab["text"], ha="center", va="center", fontsize=7, color=lab["color"], zorder=6)
 
 
-def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
-                  max_traces=6, tint_values=None, split_chain=False, n_grid=600):
+def plot_progress(sweep_dir, color_by, tint_by, out=None, t_max=None, facet=False,
+                  max_traces=6, tint_values=None, split_chain=False, spread="none",
+                  n_grid=600, ax=None, labels_out=None, legend=True):
+    """Standalone: draws and saves its own figure to `out`.
+    Embedded (see plot_progress_row): pass `ax` to draw into a panel of the
+    caller's figure; the inline value labels need the final layout, so they are
+    appended to `labels_out` as (ax, labels, grid, ymax, {policy: colour}, has_other_swarms, has_upstream) for the caller to place
+    once the figure is laid out. No saving or layout is done in that mode."""
+    if ax is not None and (facet or labels_out is None):
+        raise ValueError("embedding via ax= needs facet=False and a labels_out list")
+    if ax is None and out is None:
+        raise ValueError("pass out= (standalone) or ax= (embedded)")
     trials = load_manifest(sweep_dir)
     for key in (color_by, tint_by):
         sample = next(iter(trials.values()))
@@ -292,6 +321,8 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
 
     # (color value, tint value) -> per-trial mean-peer curve on the common grid
     groups = defaultdict(list)       # main (solid) line: mean healthy peer, or healthy peers DOWNSTREAM of a slow node
+    other_groups = defaultdict(list)  # (policy, tint, swarm) -> mean healthy peer in a NON-target swarm (dashed)
+    pool = defaultdict(list)         # (policy, tint) -> (n_peers x grid) arrays of the peers behind the solid line
     up_groups = defaultdict(list)    # --split-chain only: healthy peers UPSTREAM of the slow node (dotted)
     seeder_curve = None
     n_skipped = n_split = 0
@@ -302,18 +333,38 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
         if not healthy:           # every peer slow: no healthy mean to draw
             n_skipped += 1
             continue
-        if split_chain and r["chain"] and any(p[3] for p in peers):
-            order = {aid: k for k, aid in enumerate(r["chain"])}
-            slow_k = min(order[p[4]] for p in peers if p[3])
-            up = [hold(p[0], p[1], grid) for p in peers if not p[3] and order[p[4]] < slow_k]
-            dn = [hold(p[0], p[1], grid) for p in peers if not p[3] and order[p[4]] > slow_k]
+        def side(p, tid):
+            """'up' / 'dn': is peer p upstream / downstream of the slow peer in swarm `tid`'s cascade
+            chain (None if that swarm has no valid chain or no slow peer in it)."""
+            chain = r["chains"].get(tid)
+            if not chain:
+                return None
+            pos = {a: k for k, a in enumerate(chain)}
+            slow_pos = [pos[q[4]] for q in peers if q[3] and q[4] in pos]
+            if not slow_pos or p[4] not in pos or pos[p[4]] == min(slow_pos):
+                return None
+            return "up" if pos[p[4]] < min(slow_pos) else "dn"
+        # each peer's TARGET curve is split by the chain of its OWN target swarm
+        sides = {p[4]: side(p, p[6]) for p in peers if not p[3]}
+        do_split = split_chain and any(p[3] for p in peers) and all(s for s in sides.values())
+        if do_split:
+            up = [hold(p[0], p[1], grid) for p in peers if not p[3] and sides[p[4]] == "up"]
+            dn = [hold(p[0], p[1], grid) for p in peers if not p[3] and sides[p[4]] == "dn"]
             if up:
                 up_groups[key].append(np.vstack(up).mean(axis=0))
             if dn:
                 groups[key].append(np.vstack(dn).mean(axis=0))
+                pool[key].append(np.vstack(dn))
             n_split += 1
         else:
             groups[key].append(np.vstack(healthy).mean(axis=0))
+            pool[key].append(np.vstack(healthy))
+        for o in sorted({o for p in peers if not p[3] for o in p[5]}):
+            # other swarms follow the same rule as the solid line: with a split, only the peers
+            # downstream of the slow peer in THAT swarm's chain; otherwise every healthy peer
+            sel = [p for p in peers if not p[3] and o in p[5] and (not do_split or side(p, o) == "dn")]
+            if sel:
+                other_groups[(*key, o)].append(np.vstack([hold(*p[5][o][:2], grid) for p in sel]).mean(axis=0))
         if seeder_curve is None:
             seeder_curve = hold(r["seeder"][0], r["seeder"][1], grid)
     if n_skipped:
@@ -343,7 +394,10 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
         # axes = axes[0]
         # ax_for = {cv: axes[i] for i, cv in enumerate(color_vals)}
     else:
-        fig, ax = plt.subplots(figsize=(8.6, 5.4))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8.6, 5.4))
+        else:
+            fig = ax.figure
         axes = [ax]
         ax_for = {cv: ax for cv in color_vals}
 
@@ -352,7 +406,18 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
         ax = ax_for[cv]
         mean_curves = {tv: np.vstack(groups[(cv, tv)]).mean(axis=0) for tv in tint_vals if (cv, tv) in groups}
         for tv, mc in mean_curves.items():
+            if spread != "none":
+                # repeats: spread of the per-trial mean peer over repeats (seed noise)
+                # peers:   spread of individual healthy peers, pooled over repeats
+                rows = np.vstack(groups[(cv, tv)] if spread == "repeats" else pool[(cv, tv)])
+                if len(rows) > 1:
+                    ax.fill_between(grid, rows.min(0), rows.max(0), color=shade(base(cv), rank[tv], n_shades),
+                                    alpha=0.18, linewidth=0, zorder=1)
             ax.plot(grid, mc, color=shade(base(cv), rank[tv], n_shades), lw=1.8, zorder=3)
+        for (c2, tv, o), curves in sorted(other_groups.items(), key=lambda kv: str(kv[0])):
+            if c2 == cv:      # other swarms: same colour, dashed, no inline label
+                ax.plot(grid, np.vstack(curves).mean(axis=0), color=shade(base(cv), rank[tv], n_shades),
+                        lw=1.3, ls=(0, (5, 2.5)), zorder=2.5)
         for tv in tint_vals:
             if up_groups.get((cv, tv)):
                 ax.plot(grid, np.vstack(up_groups[(cv, tv)]).mean(axis=0),
@@ -374,7 +439,7 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
                                        "color": mix(shade(base(cv), rank[cluster[0]], n_shades), (0, 0, 0), 0.30)})
 
     for ax in axes:
-        ax.plot(grid, seeder_curve, color="black", lw=1.1, ls="--", zorder=4)
+        ax.plot(grid, seeder_curve, color="black", lw=3.2, ls="-", zorder=2, solid_capstyle="butt")
         ax.set_xlim(0, 2500)
         # ax.set_xlim(0, t_max)
         ax.set_ylim(-0.04 * ymax, 1.06 * ymax)
@@ -394,18 +459,24 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
         extra = [Line2D([0], [0], color="#444", lw=1.0, ls=":",
                         label="cascading: healthy peers\nupstream of the slow node")]
     lines = [Line2D([0], [0], color="#444", lw=1.8, ls="-", label=main_label), *extra,
-             Line2D([0], [0], color="black", lw=1.1, ls="--", label="seeder (published)"),
+             Line2D([0], [0], color="black", lw=3.2, ls="-", label="seeder (published)"),
              Line2D([0], [0], color="none", label=f"line labels: {tint_by}"
                                                    f"\n(light = low, dark = high)")]
     host = axes[-1]
-    leg1 = host.legend(handles=pol, title=color_by, fontsize=8, title_fontsize=8,
-                       loc="upper center", bbox_to_anchor=(1.12, 1.0), frameon=False)
+    if legend:
+        leg1 = host.legend(handles=pol, title=color_by, fontsize=8, title_fontsize=8,
+                           loc="upper center", bbox_to_anchor=(1.12, 1.0), frameon=False)
     keys = {'heterogeneity.slow_factor':'Radio Degradation Factor (%)',
             'agents.peers.0.count':'Number of Peers',
             'radio.fixed.d0':'Radio Strength (distance at which link rate is halved)'}
     ax.set_title(f'Sweep over {keys.get(tint_by)}')
     # host.add_artist(leg1)
     # host.legend(handles=lines, fontsize=8, loc="lower left", bbox_to_anchor=(1.12, 0.0), frameon=False)
+
+    if labels_out is not None:
+        labels_out.append((ax, labels_for[id(ax)], grid, ymax, {cv: base(cv) for cv in color_vals},
+                           bool(other_groups), bool(up_groups)))
+        return
 
     fig.subplots_adjust(left=0.07, right=0.80 if not facet else 0.84, bottom=0.12, top=0.92)
     for ax in axes:
@@ -414,6 +485,73 @@ def plot_progress(sweep_dir, color_by, tint_by, out, t_max=None, facet=False,
     fig.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote {out}  ({len(raw) - n_skipped} trials, {len(groups)} policy x sweep cells, t_max={t_max:.0f}s)")
+
+
+def picker_label(cv):
+    return str(cv).replace("_", "-").capitalize()
+
+
+def plot_progress_row(specs, out, figsize=(15.0, 4.4), letters=True, legend=True, **common):
+    """One figure, one panel per sweep (1 x len(specs)), sharing the y-axis.
+    Each spec is a dict of plot_progress kwargs for that panel (at least
+    sweep_dir and tint_by; optionally tint_values, split_chain, ...);
+    `common` kwargs (color_by, spread, split_chain, ...) apply to every panel
+    unless a spec overrides them. `legend` adds one shared legend under the
+    panels: title "Piece Picker", the seeder (black dashed) then each policy."""
+    fig, axes = plt.subplots(1, len(specs), figsize=figsize, squeeze=False)
+    axes = axes[0]
+    pending = []
+    for ax, spec in zip(axes, specs):
+        kw = {"color_by": "agents.peers.0.strategy", **common, **spec}
+        plot_progress(**kw, ax=ax, labels_out=pending, legend=False)
+    same_y = len({round(p[3]) for p in pending}) == 1
+    if same_y:      # one common scale: label the left panel only
+        for ax in axes[1:]:
+            ax.set_ylabel("")
+            ax.tick_params(labelleft=False)
+    if letters:
+        for ax, letter in zip(axes, "abcdefgh"):
+            ax.set_title(f"({letter}) {ax.get_title()}", fontsize=10)
+    fig.tight_layout()                       # labels depend on the final axes size
+    if not same_y:
+        print("note: panels publish different numbers of maps "
+              f"({sorted({round(p[3]) for p in pending})}); each keeps its own y-axis")
+    for ax, labs, grid, ymax, *_ in pending:
+        place_labels(fig, ax, labs, grid, ymax)
+    if legend:
+        colours = {}
+        for p in pending:
+            colours.update(p[4])
+        multi = any(p[5] for p in pending)
+        has_up = any(p[6] for p in pending)
+        order = list(STRATEGY_COLORS)
+        policies = sorted(colours, key=lambda p: (order.index(p) if p in order else len(order), str(p)))
+        pick = [Line2D([0], [0], color="black", lw=3.2, label="Seeder"),
+                *[Line2D([0], [0], color=colours[p], lw=3, label=picker_label(p)) for p in policies]]
+        kw = dict(loc="upper left", frameon=False, fontsize=9, title_fontsize=10)
+        legs = [fig.legend(handles=pick, title="Piece Picker", ncol=len(pick),
+                           bbox_to_anchor=(0.0, 0.0), **kw)]
+        if multi:   # line type = which swarm: only meaningful in the multi-swarm case
+            swarm = [Line2D([0], [0], color="#444", lw=1.8, ls="-", label="Target"),
+                     Line2D([0], [0], color="#444", lw=1.5, ls=(0, (5, 2.5)), label="Other")]
+            if has_up:   # --split-chain: cascading peers upstream of the slow node, target swarm
+                swarm.append(Line2D([0], [0], color="#444", lw=1.6, ls=(0, (1, 2)),
+                                    label="Target, upstream of slow node"))
+            legs.append(fig.legend(handles=swarm, title="Swarm", ncol=len(swarm),
+                                   bbox_to_anchor=(0.0, 0.0), **kw))
+        # centre the legend group under the panels: measure, then shift
+        fig.canvas.draw()
+        inv = fig.transFigure.inverted()
+        widths = [inv.transform(l.get_window_extent())[1][0] - inv.transform(l.get_window_extent())[0][0]
+                  for l in legs]
+        gap = 0.04
+        x = (1 - (sum(widths) + gap * (len(legs) - 1))) / 2
+        for l, w in zip(legs, widths):
+            l.set_bbox_to_anchor((x, 0.0), transform=fig.transFigure)
+            x += w + gap
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {out}  ({len(specs)} panels)")
 
 
 def parse_val(s):
@@ -436,6 +574,9 @@ if __name__ == "__main__":
     ap.add_argument("--split-chain", action="store_true",
                     help="Cascading trials with a slow peer: draw healthy peers downstream of the slow "
                          "node (solid) and upstream of it (dotted) separately instead of one blended mean")
+    ap.add_argument("--spread", choices=["none", "repeats", "peers"], default="none",
+                    help="Shade the spread behind each solid line: across repeats of the mean peer, "
+                         "or across individual peers (default none)")
     ap.add_argument("--max-traces", type=int, default=6,
                     help="Max sweep values drawn per policy (default 6); longer sweeps are thinned evenly")
     ap.add_argument("--tint-values", default=None,
@@ -445,4 +586,4 @@ if __name__ == "__main__":
     plot_progress(a.sweep_dir, a.color_by, a.tint_by, a.out or os.path.join(a.sweep_dir, "progress.pdf"),
                   t_max=a.t_max, facet=a.facet, max_traces=a.max_traces,
                   tint_values=[parse_val(s) for s in a.tint_values.split(",")] if a.tint_values else None,
-                  split_chain=a.split_chain)
+                  split_chain=a.split_chain, spread=a.spread)
