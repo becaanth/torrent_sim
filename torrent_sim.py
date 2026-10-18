@@ -813,13 +813,19 @@ def build_simulation_from_config(config):
         all_agents.append(agent)
         return agent
 
+    n_slow_seeders = min(config.heterogeneity.n_slow_seeders, len(config.agents.seeders))
     seeders = {}
-    for seeder_spec in config.agents.seeders:
+    for seeder_idx, seeder_spec in enumerate(config.agents.seeders):
         name = seeder_spec.direction
-        seeder = spawn_agent(position=(0.0, 0.0), radio_overrides=seeder_spec.radio_overrides)
-        seeder.join_swarm(swarms[name], strategy="rarest_random", is_seeder=True, is_target=True)
+        is_slow_seeder = seeder_idx < n_slow_seeders
+        seeder = spawn_agent(position=(0.0, 0.0), radio_overrides=seeder_spec.radio_overrides,
+            degrade=is_slow_seeder, force_slow=True if is_slow_seeder else None)
+        seeder.join_swarm(swarms[name], strategy="rarest_random", is_seeder=True, is_target=True)         
         seeders[name] = seeder
         sim.start_seeder(seeder, name, interval=config.simulation.tick_interval)
+        if config.churn.seeder_churn:       # off by default: seeders are the publishers
+            seeder.is_bad = True
+            sim.start_churn(seeder, config.churn.p_bad, config.churn.mean_down)
 
     # if heterogeneity mode is n_slow, pick exactly n slow peer indices
     total_peer_count = sum(group.count for group in config.agents.peers)
@@ -854,6 +860,20 @@ def build_simulation_from_config(config):
 
             all_peers.append(peer)
 
+    if config.agents.seeders_as_peers:
+        # Each seeder also takes part in every OTHER swarm like a peer: it downloads and relays those maps
+        # using the same piece-picking policy the swarm's peers use. It keeps one radio, so its upload and
+        # download capacity is shared across every swarm it is in, and a slow seeder is slow in all of them.
+        policies = {(g.strategy, g.hybrid_s, g.segment_k) for g in config.agents.peers}
+        if len(policies) != 1:
+            raise ValueError("agents.seeders_as_peers needs one piece-picking policy across all peer groups "
+                             f"(found {sorted(policies)}) -- seeders adopt 'the swarm's policy'")
+        strategy, hybrid_s, segment_k = next(iter(policies))
+        for name, seeder in seeders.items():
+            for other in config.topology.directions:
+                if other != name:
+                    seeder.join_swarm(swarms[other], strategy=strategy, hybrid_s=hybrid_s, segment_k=segment_k)
+
     sim.agents = all_agents
 
     for name in config.topology.directions:
@@ -875,7 +895,8 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
 
     swarm_t_max = {}
     for t_id, swarm in sim.swarms.items():
-        peers_in_swarm = [p for p in swarm.sorted_participants() if t_id not in p.seeded_torrents]
+        # "peers" = agents that publish nothing; seeders relaying someone else's swarm don't count as peers
+        peers_in_swarm = [p for p in swarm.sorted_participants() if not p.seeded_torrents]
         seed_agents = [p for p in swarm.sorted_participants() if t_id in p.seeded_torrents]
         n_peers = len(peers_in_swarm)
         if n_peers == 0:
@@ -888,8 +909,8 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
     # 3. Build metric rows
     metrics_rows = []
     for agent in all_agents:
-        is_seed = len(agent.seeded_torrents) > 0
         for t_id in agent.strategies:
+            is_seed = t_id in agent.seeded_torrents      # per swarm: a seeder is a plain relay in the others
             role = "SEED" if is_seed else ("TARGET" if t_id == agent.target_torrent_id else "relay")
             session_complete = agent.finish_time.get(t_id) is not None
             t, s, r = (None, None, None) if (is_seed or not session_complete) else agent.get_metrics(sim, t_id)
@@ -907,7 +928,7 @@ def export_results(sim, all_agents, log_header, output_dir=".", write_log=True):
                 "sequentiality": s,
                 "robustness": r,
                 "n_peers": None if is_seed else len(
-                    [p for p in sim.swarms[t_id].participants if t_id not in p.seeded_torrents]),
+                    [p for p in sim.swarms[t_id].participants if not p.seeded_torrents]),
                 "t_max_mbps": None if is_seed else swarm_t_max[t_id],
                 "start_time": agent.start_time[t_id],
                 "finish_time": agent.finish_time[t_id],

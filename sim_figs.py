@@ -1,9 +1,10 @@
 from plot_progress import *
 
-EXPERIMENT = 'convoy' # or 'multi'
-# EXPERIMENT = 'multi'
+# EXPERIMENT = 'convoy' # or 'multi'
+EXPERIMENT = 'multi'
 if __name__ == '__main__':
-    results_dirs = [f'results/checkpoint/sweep_{policy}_base_{EXPERIMENT}' for policy in ['s','rr','c']]
+    # results_dirs = [f'results/checkpoint/sweep_{policy}_base_{EXPERIMENT}' for policy in ['s','rr','c']]
+    results_dirs = [f'results/sweep_{policy}_base_{EXPERIMENT}' for policy in ['s','rr','c']]
 
     # for key, item in params.items():
     #     print(key, item)
@@ -38,5 +39,6 @@ if __name__ == '__main__':
         plot_progress_row(
             [dict(sweep_dir=d, tint_by=k, tint_values=v) for d, k, v in params.values()],
             out=f'plots/{EXPERIMENT}/progress_row.pdf',
+            spread='peers',
             split_chain=True,
         )
